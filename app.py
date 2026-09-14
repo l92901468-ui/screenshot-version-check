@@ -11,7 +11,26 @@ PORT = int(os.environ.get("PORT", "8001"))
 NAME = f"api-{PORT}"
 log = logutil.setup(NAME)
 
+# ===== 无状态约定 =====
+# 这个 API 实例不保存任何会话状态，任何请求落到任何一个实例结果都一样：
+#   1. 认证：Bearer token 自包含（uid + 过期时间 + HMAC 签名），服务端不存 session
+#   2. 业务状态：一律在 DB（结构化状态）和对象存储（大文件），进程重启即丢的东西不算状态
+#   3. 幂等：靠 DB 唯一索引 (user_id, idempotency_key)，跨实例共享
+# 下面两样是可随时丢弃的本地加速件，丢了只影响性能不影响正确性：
+#   - CACHE：DB 的只读副本，可用 CACHE_ENABLED=0 整个关掉
+#   - metrics 的请求延时滑动窗口：进程内观测值，不是权威指标（权威指标由 DB 派生）
+STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "1") == "1"
+TERMINAL_STATES = {"done", "dlq", "rejected"}   # 只缓存终态；中间态每次回源，避免各实例看到不同中间状态
+
 CACHE = TTLCache(hard_ttl=10.0, soft_ttl=3.0)
+
+
+def _payload(row):
+    payload = {k: row[k] for k in ("id", "user_id", "status", "retry_count", "object_key",
+                                   "result_msg", "detected_version", "required_version", "updated_at")}
+    payload["status_text"] = sm.STATES.get(payload["status"], payload["status"])
+    return payload
 
 
 def err(action, http_status, msg):
@@ -22,6 +41,13 @@ def err(action, http_status, msg):
 
 
 def read_task(sid):
+    """读任务。CACHE_ENABLED=0 时完全不碰本地缓存（纯无状态模式）。"""
+    if not CACHE_ENABLED:
+        row = db.get_task(sid)
+        if row is None:
+            return None, "miss"
+        return _payload(row), "db(无缓存模式)"
+
     cached, need_verify = CACHE.get(sid)
     if cached is not None and not need_verify:
         log.info(f"缓存读 sid={sid} 命中（未过期）")
@@ -31,16 +57,20 @@ def read_task(sid):
     if row is None:
         CACHE.invalidate(sid)
         return None, "miss"
-    payload = {k: row[k] for k in ("id", "user_id", "status", "retry_count", "object_key",
-                                   "result_msg", "detected_version", "required_version", "updated_at")}
-    payload["status_text"] = sm.STATES.get(payload["status"], payload["status"])
+    payload = _payload(row)
     if cached is not None:
         conflict = cached.get("updated_at") != payload["updated_at"]
         if conflict:
             log.warning(f"缓存与DB冲突 sid={sid} 以DB为准（缓存 updated_at={cached.get('updated_at')} DB={payload['updated_at']}）")
         CACHE.set(sid, payload)
         return payload, "db(冲突以DB为准)" if conflict else "cache(已核对)"
-    CACHE.set(sid, payload)
+
+    # 只把终态放进缓存：pending/processing 每次回源，
+    # 否则同一个任务在不同实例上可能返回不同的中间状态，破坏无状态假设
+    if payload["status"] in TERMINAL_STATES:
+        CACHE.set(sid, payload)
+    else:
+        CACHE.invalidate(sid)
     return payload, "db"
 
 
@@ -99,7 +129,11 @@ class Handler(BaseHTTPRequestHandler):
         m = metrics.collect()
         log.info(f"健康检查被查询 CPU={m['cpu_percent']}% 内存={m['memory_percent']}% "
                  f"队列={m['queue_depth']} DLQ={m['dlq_count']} 通过率={m['pass_rate_percent']}%")
-        self._send(200, {"ok": True, "action": "success", "health": m})
+        # instance 段：证明这个实例只是"无状态的副本"，杀掉任何一个都不丢状态
+        inst = {"name": NAME, "pid": os.getpid(), "started_at": STARTED_AT,
+                "cache_enabled": CACHE_ENABLED, "cache_keys": CACHE.size() if CACHE_ENABLED else 0,
+                "db_pool": db.pool_stats()}
+        self._send(200, {"ok": True, "action": "success", "health": m, "instance": inst})
 
     # ---------- 登录 ----------
     def handle_login(self):

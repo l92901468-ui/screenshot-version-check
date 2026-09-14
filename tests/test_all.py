@@ -9,8 +9,8 @@ from cache import TTLCache
 
 class Base(unittest.TestCase):
     def setUp(self):
-        # 每个用例用独立临时库，互不干扰
-        db.DB_PATH = os.path.join(tempfile.mkdtemp(), "test.db")
+        # 每个用例用独立临时库，互不干扰（连接池也要跟着重建，否则连的还是上一个库）
+        db.reset_pool(os.path.join(tempfile.mkdtemp(), "test.db"))
         db.init_db()
 
     def new_task(self):
@@ -97,6 +97,85 @@ class TestDb(Base):
     def test_find_pending(self):
         sid = self.new_task()
         self.assertEqual(db.find_pending_id(), sid)
+
+
+
+
+class TestConnectionPool(Base):
+    """连接池：复用、上限、超时、切换。"""
+
+    def test_connection_reused(self):
+        before = db.pool_stats()["borrows"]      # setUp 里的 init_db 已经借过一次
+        db.get_task(1)
+        db.get_task(1)
+        st = db.pool_stats()
+        self.assertEqual(st["borrows"], before + 2)
+        self.assertLessEqual(st["created"], 1, "两次查询应该复用同一个连接，而不是各建一条")
+
+    def test_pool_limit_and_timeout(self):
+        path = os.path.join(tempfile.mkdtemp(), "pool.db")
+        pool = db.ConnectionPool(path, size=1, timeout=0.3)
+        with pool.connection():
+            with self.assertRaises(RuntimeError):
+                with pool.connection():
+                    pass
+        # 归还之后可以再借
+        with pool.connection():
+            pass
+        self.assertGreaterEqual(pool.stats()["waits"], 1)
+
+    def test_reset_pool_switch_db(self):
+        a = os.path.join(tempfile.mkdtemp(), "a.db")
+        b = os.path.join(tempfile.mkdtemp(), "b.db")
+        db.reset_pool(a)
+        db.init_db()
+        sid = db.insert_task(1, "k1", {"key": "k", "path": "/tmp/k", "hash": "h"})
+        self.assertIsNotNone(db.get_task(sid))
+        db.reset_pool(b)
+        db.init_db()
+        self.assertIsNone(db.get_task(sid), "切换库后不应再看到上一个库的数据")
+
+
+class TestStateless(Base):
+    """无状态：关掉本地缓存后行为一致；中间态不进缓存。"""
+
+    def setUp(self):
+        super().setUp()
+        import app
+        self.app = app
+        app.CACHE.clear()
+
+    def test_cache_disabled_hits_db(self):
+        self.app.CACHE_ENABLED = False
+        sid = self.new_task()
+        task, src = self.app.read_task(sid)
+        self.assertEqual(src, "db(无缓存模式)")
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(self.app.CACHE.size(), 0, "无缓存模式不该往本地缓存写东西")
+
+    def test_only_terminal_state_cached(self):
+        self.app.CACHE_ENABLED = True
+        sid = self.new_task()
+        _, src = self.app.read_task(sid)
+        self.assertEqual(self.app.CACHE.size(), 0, "pending 是中间态，不该进缓存")
+        sm.transition(sid, "processing")
+        sm.transition(sid, "done", detected_version="10.0.19045")
+        _, src2 = self.app.read_task(sid)
+        self.assertEqual(self.app.CACHE.size(), 1, "done 是终态，应该进缓存")
+
+    def test_cache_conflict_falls_back_to_db(self):
+        self.app.CACHE_ENABLED = True
+        sid = self.new_task()
+        sm.transition(sid, "processing")
+        sm.transition(sid, "done", detected_version="10.0.19045")
+        task, _ = self.app.read_task(sid)
+        # 手动塞一份"落后于 DB"的缓存，并把它写成 5 秒前（越过 soft_ttl 触发回源核对）
+        stale = dict(task, status="pending", updated_at="2000-01-01 00:00:00")
+        with self.app.CACHE._lock:
+            self.app.CACHE._data[sid] = (stale, time.time() - 5)
+        db.update_task(sid, "done", {"status": "dlq"})
+        fresh, src = self.app.read_task(sid)
+        self.assertEqual(fresh["status"], "dlq", "缓存与 DB 冲突时必须以 DB 为准")
 
 
 if __name__ == "__main__":

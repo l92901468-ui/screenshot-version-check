@@ -1,0 +1,81 @@
+# 生产环境容器化接管（**已写好但未启用**）
+#
+# 现状：prod 由 systemd 跑源码（api@8001/8002/8003 + worker@1/2 + healthd），
+#       nginx upstream 指向 127.0.0.1:8001-8003。
+# 启用步骤与回退步骤见 cd/prod-container/README.md，启用脚本是 cd/prod-container/enable.sh。
+#
+# 几个关键决定：
+#   1. 数据用 bind mount 挂宿主的 /home/ubuntu/screenshot-api/data，而不是 named volume。
+#      原因是容器和 systemd 两套必须读写同一个 SQLite 文件，用卷会各自一份、数据分叉。
+#   2. 容器以 uid 1000:1001（宿主 ubuntu）运行，否则没有权限写共享目录。
+#   3. 这里**不跑 healthd 容器**：健康检查与自动回滚留在宿主的 systemd healthd，
+#      因为回滚需要 git + systemctl，容器里没有这两样。
+#   4. 端口 911x 避开现网 8001-8003，切换期间两套可并存，方便回退。
+services:
+  api1:
+    image: ${IMAGE_TAG:-screenshot-api:latest}
+    command: python3 app.py
+    user: "1000:1001"
+    environment:
+      PORT: "8001"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+      DB_POOL_SIZE: "8"
+    ports: ["9111:8001"]
+    volumes: ["/home/ubuntu/screenshot-api/data:/data"]
+    restart: always
+
+  api2:
+    image: ${IMAGE_TAG:-screenshot-api:latest}
+    command: python3 app.py
+    user: "1000:1001"
+    environment:
+      PORT: "8001"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+      DB_POOL_SIZE: "8"
+    ports: ["9112:8001"]
+    volumes: ["/home/ubuntu/screenshot-api/data:/data"]
+    restart: always
+
+  api3:
+    image: ${IMAGE_TAG:-screenshot-api:latest}
+    command: python3 app.py
+    user: "1000:1001"
+    environment:
+      PORT: "8001"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+      DB_POOL_SIZE: "8"
+    ports: ["9113:8001"]
+    volumes: ["/home/ubuntu/screenshot-api/data:/data"]
+    restart: always
+
+  worker1:
+    image: ${IMAGE_TAG:-screenshot-api:latest}
+    command: python3 worker.py
+    user: "1000:1001"
+    environment:
+      WORKER_ID: "1"
+      WORKER_THREADS: "4"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+      DB_POOL_SIZE: "8"
+    volumes: ["/home/ubuntu/screenshot-api/data:/data"]
+    restart: always
+
+  worker2:
+    image: ${IMAGE_TAG:-screenshot-api:latest}
+    command: python3 worker.py
+    user: "1000:1001"
+    environment:
+      WORKER_ID: "2"
+      WORKER_THREADS: "4"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+      DB_POOL_SIZE: "8"
+    volumes: ["/home/ubuntu/screenshot-api/data:/data"]
+    restart: always

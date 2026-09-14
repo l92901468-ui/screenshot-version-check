@@ -40,6 +40,10 @@ class TTLCache:
         with self._lock:
             self._data.pop(key, None)
 
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
     def size(self):
         with self._lock:
             self._purge(time.time())
