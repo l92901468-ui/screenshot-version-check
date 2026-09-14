@@ -1,2 +1,139 @@
 [14:44:16] CI 流水线启动 | BUILD=20260914144416 | 阶段: push -> build -> test -> scan
 [14:44:16] ========== 阶段 push (代码推送) 开始 ==========
+[14:44:16] [PASS] 已提交变更
+[14:44:16] [PASS] push 成功 -> 8d0d5e3
+[14:44:16] ---------- 阶段 push (代码推送) 耗时 53ms ----------
+[14:44:16] ========== 阶段 build (Docker 镜像构建) 开始 ==========
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 456B 0.0s done
+#1 DONE 0.1s
+
+#2 [internal] load metadata for docker.io/library/python:3.12-slim
+#2 DONE 0.9s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 113B done
+#3 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 resolve docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea 0.0s done
+#4 ...
+
+#5 [internal] load build context
+#5 transferring context: 66.22kB done
+#5 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f 0B / 12.12MB 0.2s
+#4 sha256:56235e4245636e401a28cf88944d543b29ee028ae3b6c27e03d6b43e7b4eac5f 249B / 249B 0.2s done
+#4 sha256:dbd0b7849e6c06b61e1fa6b7ffe053f246ce0075890620e3db64b47bb662433a 0B / 4.27MB 0.2s
+#4 sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be 0B / 29.79MB 0.2s
+#4 sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f 1.05MB / 12.12MB 0.5s
+#4 sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f 8.39MB / 12.12MB 0.6s
+#4 sha256:dbd0b7849e6c06b61e1fa6b7ffe053f246ce0075890620e3db64b47bb662433a 4.27MB / 4.27MB 0.5s done
+#4 sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be 3.15MB / 29.79MB 0.5s
+#4 sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f 12.12MB / 12.12MB 0.7s done
+#4 sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be 29.79MB / 29.79MB 0.8s done
+#4 extracting sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be
+#4 extracting sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be 0.9s done
+#4 DONE 1.7s
+
+#4 [1/4] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 extracting sha256:dbd0b7849e6c06b61e1fa6b7ffe053f246ce0075890620e3db64b47bb662433a 0.1s done
+#4 DONE 1.9s
+
+#4 [1/4] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 extracting sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f
+#4 extracting sha256:1560cfed01dc4c72c07f789d860078d74466a1f9a26b33a2e35d887b5f90dd3f 0.4s done
+#4 DONE 2.3s
+
+#4 [1/4] FROM docker.io/library/python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+#4 extracting sha256:56235e4245636e401a28cf88944d543b29ee028ae3b6c27e03d6b43e7b4eac5f 0.0s done
+#4 DONE 2.3s
+
+#6 [2/4] WORKDIR /app
+#6 DONE 0.2s
+
+#7 [3/4] COPY . /app
+#7 DONE 0.0s
+
+#8 [4/4] RUN useradd -m -u 10001 appuser  && mkdir -p /app/logs /app/uploads  && chown -R appuser /app
+#8 DONE 0.5s
+
+#9 exporting to image
+#9 exporting layers 0.1s done
+#9 exporting manifest sha256:89fbafb0a5dfa23b6204e811407654601e44dd810daf9ae57e4bffdb01a5437f done
+#9 exporting config sha256:f8bcf8ec78db318ee80a3d20c7ce01aa4a9f3f17734aa6e69795436d42fdb2bf done
+#9 exporting attestation manifest sha256:7b94c1f0d3a38862f69b0472a535089cfc1fc774e1f9d3acb13815e1924bbac2 0.0s done
+#9 exporting manifest list sha256:4ed13cc39b0eb74e010a43dc54c8cb111ec3e2672e0fd26cd9cec396c4007f62 done
+#9 naming to docker.io/library/screenshot-api:20260914144416 done
+#9 unpacking to docker.io/library/screenshot-api:20260914144416 0.0s done
+#9 naming to docker.io/library/screenshot-api:latest
+#9 naming to docker.io/library/screenshot-api:latest done
+#9 unpacking to docker.io/library/screenshot-api:latest done
+#9 DONE 0.2s
+[14:44:21] [PASS] 镜像构建成功 screenshot-api:20260914144416
+[14:44:21] ---------- 阶段 build (Docker 镜像构建) 耗时 4983ms ----------
+[14:44:21] ========== 阶段 test (容器内单元测试) 开始 ==========
+test_charge_and_arrears (test_all.TestBilling.test_charge_and_arrears) ... ok
+test_expire_auto_delete (test_all.TestCache.test_expire_auto_delete) ... ok
+test_soft_ttl_needs_verify (test_all.TestCache.test_soft_ttl_needs_verify) ... ok
+test_find_pending (test_all.TestDb.test_find_pending) ... ok
+test_optimistic_lock (test_all.TestDb.test_optimistic_lock) ... ok
+test_arrears_recover (test_all.TestStateMachine.test_arrears_recover) ... 2026-09-14 06:44:23,163 [INFO] api-0 | 状态转换 sid=1 pending -> processing
+2026-09-14 06:44:23,172 [INFO] api-0 | 状态转换 sid=1 processing -> arrears result_msg=欠费
+2026-09-14 06:44:23,178 [INFO] api-0 | 状态转换 sid=1 arrears -> pending result_msg=充值
+ok
+test_illegal_transition_rejected (test_all.TestStateMachine.test_illegal_transition_rejected) ... 2026-09-14 06:44:23,195 [ERROR] api-0 | 非法状态转换已拒绝 sid=1 pending(等待中) -> done(完成)
+ok
+test_legal_transition (test_all.TestStateMachine.test_legal_transition) ... 2026-09-14 06:44:23,216 [INFO] api-0 | 状态转换 sid=1 pending -> processing
+2026-09-14 06:44:23,222 [INFO] api-0 | 状态转换 sid=1 processing -> done result_msg=ok
+ok
+test_terminal_cannot_reprocess (test_all.TestStateMachine.test_terminal_cannot_reprocess) ... 2026-09-14 06:44:23,245 [INFO] api-0 | 状态转换 sid=1 pending -> processing
+2026-09-14 06:44:23,250 [INFO] api-0 | 状态转换 sid=1 processing -> dlq retry_count=3 result_msg=失败
+2026-09-14 06:44:23,251 [ERROR] api-0 | 非法状态转换已拒绝 sid=1 dlq(待人工审核) -> processing(处理中)
+ok
+test_meets_version (test_all.TestVersion.test_meets_version) ... ok
+test_parse_version (test_all.TestVersion.test_parse_version) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 1.207s
+
+OK
+[14:44:23] [PASS] 单元测试全部通过
+[14:44:23] ---------- 阶段 test (容器内单元测试) 耗时 2057ms ----------
+[14:44:23] ========== 阶段 scan (安全与质量扫描) 开始 ==========
+=== scan 阶段明细 ===
+  语法扫描                         发现 16 条  0ms
+  静态规则扫描(模拟semgrep)            发现 2 条  14ms
+  镜像漏洞扫描(模拟trivy)              发现 2 条  0ms
+  依赖成分扫描(模拟SCA)                发现 0 条  0ms
+=== 问题清单 ===
+  [CRITICAL] PY-COMPILE     app.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     auth_token.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     billing.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     cache.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     ci/scan.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     db.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     healthd.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     logutil.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     metrics.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     object_store.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     recognize.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     rollback.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     state_machine.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     tests/test_all.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     validate.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [CRITICAL] PY-COMPILE     worker.py:0  语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it
+  [HIGH    ] CVE-2024-0002-sim image:screenshot-api:20260914144416:0  python:3.12-slim 基础镜像中的 zlib（模拟条目） [模拟]
+  [MEDIUM  ] PY-SHELL-T     ci/scan.py:33  subprocess 使用 shell=True 有注入风险
+  [MEDIUM  ] CVE-2024-0003-sim image:screenshot-api:20260914144416:0  python:3.12-slim 基础镜像中的 glibc（模拟条目） [模拟]
+  [MEDIUM  ] PY-SHELL-T     rollback.py:49  subprocess 使用 shell=True 有注入风险
+=== 门禁 ===
+  统计: CRITICAL=16  HIGH=1  MEDIUM=3  LOW=0  INFO=0
+  结果: FAILED -> CRITICAL 16 > 上限 0
+  报告: /home/ubuntu/screenshot-api/ci/reports/scan-20260914144423.json
+[14:44:23] [FAIL] 扫描门禁拦截，流水线终止
+[14:44:23] ---------- 阶段 scan (安全与质量扫描) 耗时 75ms ----------

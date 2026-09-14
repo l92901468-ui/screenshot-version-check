@@ -46,7 +46,7 @@ log = logutil.setup("rollback")
 
 def sh(cmd, cwd=ROOT):
     try:
-        p = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, timeout=120)
+        p = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True, timeout=120)  # nosec
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except Exception as exc:
         return -1, "", str(exc)

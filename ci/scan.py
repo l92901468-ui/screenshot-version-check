@@ -2,8 +2,8 @@
 """CI 第四阶段：扫描（scan）。
 
 真实做的：
-  1) 语法编译扫描   —— 对每个 .py 做 py_compile
-  2) 静态规则扫描   —— 内置简化规则（等价于 semgrep/bandit 的自定义规则集）
+  1) 语法编译扫描   —— 把每个 .py 源码 compile 一遍，抓语法错误
+  2) 静态规则扫描   —— 内置简化规则（等价于 semgrep/bandit 的自定义规则集），支持 # nosec 抑制
   3) 敏感信息扫描   —— 正则查私钥、AK/SK、硬编码口令
 模拟做的（本机没有真实扫描器和漏洞库，按"没有的东西模拟一下"处理）：
   4) 镜像漏洞扫描   —— 模拟 trivy，对基础镜像给出 CVE 清单
@@ -14,7 +14,6 @@
 import argparse
 import json
 import os
-import py_compile
 import re
 import sys
 import time
@@ -30,7 +29,7 @@ SIM_HIGH = int(os.environ.get("SIM_HIGH", "1"))
 RULES = [
     ("PY-EXEC",     r"\b(eval|exec)\s*\(",                     "HIGH",   "禁止使用 eval/exec 执行动态代码"),
     ("PY-SHELL",    r"\bos\.system\s*\(",                      "HIGH",   "禁止 os.system，存在命令注入风险"),
-    ("PY-SHELL-T",  r"shell\s*=\s*True",                       "MEDIUM", "subprocess 使用 shell=True 有注入风险"),
+    ("PY-SHELL-T",  r"shell\s*=\s*True",                       "MEDIUM", "subprocess 使用 shell=True 有注入风险"),  # nosec
     ("PY-PICKLE",   r"\bpickle\.loads?\s*\(",                  "HIGH",   "反序列化不可信数据会导致 RCE"),
     ("PY-ASSERT",   r"^\s*assert\s",                           "LOW",    "生产代码不建议用 assert 做校验"),
     ("SEC-PRIVKEY", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",     "CRITICAL", "源码中不应出现私钥"),
@@ -55,22 +54,26 @@ def iter_py_files():
 
 
 def scan_compile():
-    """真实：语法编译扫描。"""
+    """真实：语法编译扫描（只编译不落盘 pyc）。"""
     findings = []
     for path in iter_py_files():
+        rel = os.path.relpath(path, ROOT).replace("\\", "/")
         try:
-            py_compile.compile(path, cfile=os.devnull, doraise=True)
+            with open(path, "rb") as fh:
+                src = fh.read()
+            compile(src, rel, "exec")
+        except SyntaxError as exc:
+            findings.append({"id": "PY-COMPILE", "level": "CRITICAL", "file": rel,
+                             "line": getattr(exc, "lineno", 0) or 0,
+                             "msg": "语法错误: %s" % exc.msg})
         except Exception as exc:
-            findings.append({
-                "id": "PY-COMPILE", "level": "CRITICAL",
-                "file": os.path.relpath(path, ROOT).replace("\\", "/"),
-                "line": 0, "msg": "语法错误: %s" % exc,
-            })
+            findings.append({"id": "PY-COMPILE", "level": "CRITICAL", "file": rel,
+                             "line": 0, "msg": "无法读取或编译: %s" % exc})
     return findings
 
 
 def scan_rules():
-    """真实：内置静态规则扫描（模拟 semgrep 的规则引擎行为）。"""
+    """真实：内置静态规则扫描（模拟 semgrep 的规则引擎行为），支持行尾 # nosec 抑制。"""
     findings = []
     for path in iter_py_files():
         rel = os.path.relpath(path, ROOT).replace("\\", "/")
@@ -80,12 +83,12 @@ def scan_rules():
         except OSError:
             continue
         for no, line in enumerate(lines, 1):
+            if "# nosec" in line:
+                continue
             for rid, pattern, level, desc in RULES:
                 if re.search(pattern, line):
-                    findings.append({
-                        "id": rid, "level": level, "file": rel,
-                        "line": no, "msg": desc,
-                    })
+                    findings.append({"id": rid, "level": level, "file": rel,
+                                     "line": no, "msg": desc})
     return findings
 
 

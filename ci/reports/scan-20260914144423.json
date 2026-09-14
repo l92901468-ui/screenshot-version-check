@@ -1,0 +1,185 @@
+{
+  "image": "screenshot-api:20260914144416",
+  "ts": "2026-09-14 14:44:23",
+  "stages": [
+    {
+      "stage": "语法扫描",
+      "findings": 16,
+      "ms": 0
+    },
+    {
+      "stage": "静态规则扫描(模拟semgrep)",
+      "findings": 2,
+      "ms": 14
+    },
+    {
+      "stage": "镜像漏洞扫描(模拟trivy)",
+      "findings": 2,
+      "ms": 0
+    },
+    {
+      "stage": "依赖成分扫描(模拟SCA)",
+      "findings": 0,
+      "ms": 0
+    }
+  ],
+  "counts": {
+    "CRITICAL": 16,
+    "HIGH": 1,
+    "MEDIUM": 3,
+    "LOW": 0,
+    "INFO": 0
+  },
+  "gate": "FAILED",
+  "gate_reasons": [
+    "CRITICAL 16 > 上限 0"
+  ],
+  "findings": [
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "app.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "auth_token.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "billing.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "cache.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "ci/scan.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "db.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "healthd.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "logutil.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "metrics.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "object_store.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "recognize.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "rollback.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "state_machine.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "tests/test_all.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "validate.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "PY-COMPILE",
+      "level": "CRITICAL",
+      "file": "worker.py",
+      "line": 0,
+      "msg": "语法错误: /dev/null is a non-regular file and will be changed into a regular one if import writes a byte-compiled file to it"
+    },
+    {
+      "id": "CVE-2024-0002-sim",
+      "level": "HIGH",
+      "pkg": "zlib-sim",
+      "msg": "python:3.12-slim 基础镜像中的 zlib（模拟条目）",
+      "file": "image:screenshot-api:20260914144416",
+      "line": 0,
+      "simulated": true
+    },
+    {
+      "id": "PY-SHELL-T",
+      "level": "MEDIUM",
+      "file": "ci/scan.py",
+      "line": 33,
+      "msg": "subprocess 使用 shell=True 有注入风险"
+    },
+    {
+      "id": "CVE-2024-0003-sim",
+      "level": "MEDIUM",
+      "pkg": "glibc-sim",
+      "msg": "python:3.12-slim 基础镜像中的 glibc（模拟条目）",
+      "file": "image:screenshot-api:20260914144416",
+      "line": 0,
+      "simulated": true
+    },
+    {
+      "id": "PY-SHELL-T",
+      "level": "MEDIUM",
+      "file": "rollback.py",
+      "line": 49,
+      "msg": "subprocess 使用 shell=True 有注入风险"
+    }
+  ],
+  "note": "带 simulated=True 的条目为本地无扫描器时的模拟数据",
+  "duration_ms": 14
+}
