@@ -68,12 +68,16 @@ ok "镜像就绪 $IMAGE | 目标 commit=$COMMIT"
 
 # ---------- 2. staging：容器部署 + 健康门禁 ----------
 say "---------- 阶段 staging（容器）----------"
-if $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
-  IMAGE_TAG="$IMAGE" $DOCKER compose up -d --no-build >> "$REPORT/deploy-$TS.log" 2>&1
+if IMAGE_TAG="$IMAGE" $DOCKER compose up -d --no-build >> "$REPORT/deploy-$TS.log" 2>&1; then
+  ok "staging 容器已启动（9001，直接用 CI 构建的镜像）"
+elif IMAGE_TAG="$IMAGE" $DOCKER compose up -d --build >> "$REPORT/deploy-$TS.log" 2>&1; then
+  ok "staging 容器已启动（9001，镜像不存在已本地构建）"
 else
-  IMAGE_TAG="$IMAGE" $DOCKER compose up -d --build >> "$REPORT/deploy-$TS.log" 2>&1
+  bad "staging 启动失败，详见 $REPORT/deploy-$TS.log"
+  printf '{"ts":"%s","env":"%s","image":"%s","commit":"%s","staging":"FAILED","prod":"not_run","result":"FAILED"}\n' \
+    "$(date +%Y-%m-%d\ %H:%M:%S)" "$TARGET_ENV" "$IMAGE" "$COMMIT" > "$REPORT/deploy-$TS.json"
+  exit 1
 fi
-if [ $? -eq 0 ]; then ok "staging 容器已启动（9001）"; else bad "staging 启动失败"; fi
 
 if python3 "$CD/health_gate.py" --url "$STAGING_URL" --wait 8 --times "$GATE_TIMES" --interval "$GATE_INTERVAL"; then
   STAGE_STATUS=PASSED; ok "staging 健康门禁通过"

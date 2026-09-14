@@ -8,9 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV HOST=0.0.0.0
 
 # 纯标准库，无第三方依赖，故无 pip install 步骤
+# /data 是 compose 挂载的数据卷，镜像里先建好并交给 appuser，
+# 这样 named volume 首次创建时会继承属主，容器里才有写权限
 RUN useradd -m -u 10001 appuser \
- && mkdir -p /app/logs /app/uploads \
- && chown -R appuser /app
+ && mkdir -p /app/logs /app/uploads /data/uploads \
+ && chown -R appuser /app /data
 USER appuser
 
 # 同一镜像三种角色：app.py(API) / worker.py(识别 worker) / healthd.py(健康检查)

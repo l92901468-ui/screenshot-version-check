@@ -2,7 +2,7 @@
 services:
   api1:
     build: .
-    image: screenshot-api:${IMAGE_TAG:-latest}
+    image: ${IMAGE_TAG:-screenshot-api:latest}
     command: python3 app.py
     environment:
       PORT: "8001"
@@ -14,7 +14,7 @@ services:
 
   worker1:
     build: .
-    image: screenshot-api:${IMAGE_TAG:-latest}
+    image: ${IMAGE_TAG:-screenshot-api:latest}
     command: python3 worker.py
     environment:
       WORKER_ID: "1"
@@ -25,7 +25,7 @@ services:
 
   healthd:
     build: .
-    image: screenshot-api:${IMAGE_TAG:-latest}
+    image: ${IMAGE_TAG:-screenshot-api:latest}
     command: python3 healthd.py
     environment:
       HEALTH_INTERVAL: "30"
