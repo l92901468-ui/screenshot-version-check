@@ -69,6 +69,12 @@ if $DOCKER build -t "$IMAGE:$TAG" -t "$IMAGE:latest" . >> "$RUNLOG" 2>&1; then
 else
   bad "镜像构建失败，详见 $RUNLOG"; stage_cost; exit 1
 fi
+# 产物校验：确认代码真的进了镜像（防止上下文打包不全 / 缓存串层）
+if $DOCKER run --rm "$IMAGE:$TAG" test -f /app/app.py && $DOCKER run --rm "$IMAGE:$TAG" test -d /app/tests; then
+  ok "构建产物校验通过（/app/app.py 与 /app/tests 存在）"
+else
+  bad "构建产物校验失败：镜像内容不完整，请检查 .dockerignore 与构建上下文"; stage_cost; exit 1
+fi
 stage_cost
 
 # ---------------- 阶段 3: test ----------------
@@ -91,6 +97,5 @@ stage_cost
 
 say "${GREEN}========== CI 流水线全部通过 ==========${NC}"
 say "产物: $IMAGE:$TAG | 日志: $RUNLOG"
-# 记录本次构建产物，供 CD/回滚使用
-echo "{\"commit\":\"$(git rev-parse --short HEAD)\",\"image\":\"$IMAGE:$TAG\",\"time\":\"$(date +%Y-%m-%d\ %H:%M:%S)\"}" > "$LOGDIR/last_build.json"
+printf '{"commit":"%s","image":"%s","time":"%s"}\n' "$(git rev-parse --short HEAD)" "$IMAGE:$TAG" "$(date +%Y-%m-%d\ %H:%M:%S)" > "$LOGDIR/last_build.json"
 exit 0
