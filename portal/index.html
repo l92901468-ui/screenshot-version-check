@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>截图版本核验 - 示例站</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ========== 视图 1：登录 ========== -->
+  <section id="login-view" class="view">
+    <div class="card">
+      <h1>登录</h1>
+      <p class="hint">演示模式：任意用户名 / 密码均可登录。</p>
+      <label>用户名
+        <input id="username" type="text" placeholder="请输入用户名" />
+      </label>
+      <label>密码
+        <input id="password" type="password" placeholder="请输入密码" />
+      </label>
+      <button id="login-btn">登录</button>
+      <p id="login-msg" class="msg"></p>
+    </div>
+  </section>
+
+  <!-- ========== 视图 2：上传 / 提交 / 查看状态 ========== -->
+  <section id="main-view" class="view hidden">
+    <div class="card">
+      <h1>截图版本核验</h1>
+
+      <!-- 步骤一：上传图片 -->
+      <div class="step">
+        <h2>1. 上传电脑截图</h2>
+        <input id="file-input" type="file" accept="image/*" />
+        <div id="preview" class="preview hidden">
+          <img id="preview-img" alt="截图预览" />
+        </div>
+      </div>
+
+      <!-- 步骤二：确认提交 -->
+      <div class="step">
+        <h2>2. 确认提交</h2>
+        <button id="submit-btn" disabled>确认提交</button>
+      </div>
+
+      <!-- 步骤三：查看网页传回的状态 -->
+      <div class="step">
+        <h2>3. 提交状态</h2>
+        <div id="status" class="status idle">尚未提交</div>
+        <p id="status-tip" class="tip"></p>
+        <!-- 异常时出现的“再次上传”入口（默认隐藏） -->
+        <button id="resubmit-btn" class="hidden">重新上传</button>
+      </div>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,98 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #f4f6f9;
+  color: #1f2933;
+  display: flex;
+  justify-content: center;
+  padding: 40px 16px;
+}
+
+.view { width: 100%; max-width: 480px; }
+
+.hidden { display: none !important; }
+
+.card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 28px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+}
+
+h1 { font-size: 22px; margin: 0 0 16px; }
+h2 { font-size: 15px; margin: 0 0 10px; color: #52606d; }
+
+.hint {
+  font-size: 13px;
+  color: #7b8794;
+  background: #eef2f7;
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin: 0 0 16px;
+}
+
+label {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 14px;
+}
+
+input[type="text"],
+input[type="password"] {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border: 1px solid #cbd2d9;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+input[type="file"] { font-size: 14px; }
+
+button {
+  width: 100%;
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+button:hover:not(:disabled) { background: #1d4ed8; }
+button:disabled { background: #9aa5b1; cursor: not-allowed; }
+
+.step {
+  border-top: 1px solid #e4e7eb;
+  padding: 18px 0;
+}
+.step:first-of-type { border-top: none; padding-top: 0; }
+
+.preview {
+  margin-top: 12px;
+  border: 1px dashed #cbd2d9;
+  border-radius: 8px;
+  padding: 8px;
+  text-align: center;
+}
+.preview img { max-width: 100%; max-height: 260px; border-radius: 6px; }
+
+.status {
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+}
+.status.idle     { background: #f0f2f5; color: #7b8794; }
+.status.waiting  { background: #fff4e0; color: #b25e09; }
+.status.error    { background: #fde8e8; color: #c23934; }
+.status.success  { background: #e6f6ec; color: #1f8a4c; }
+
+.tip { font-size: 13px; color: #7b8794; margin: 10px 0 0; }
+
+.msg { font-size: 13px; min-height: 18px; margin: 10px 0 0; }
