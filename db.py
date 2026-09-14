@@ -14,7 +14,7 @@ MAX_RETRY = 3  # retry 次数上限：达到即进 DLQ 待人工审核
 POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
 POOL_TIMEOUT = float(os.environ.get("DB_POOL_TIMEOUT", "10"))
 
-UPDATABLE = {"status", "retry_count", "result_msg", "detected_version", "required_version"}
+UPDATABLE = {"status", "retry_count", "result_msg", "detected_version", "required_version", "next_attempt_at"}
 
 
 class ConnectionPool:
@@ -142,11 +142,16 @@ def init_db():
                 user_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 retry_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
                 object_key TEXT, object_path TEXT, file_hash TEXT,
                 idempotency_key TEXT, result_msg TEXT,
                 detected_version TEXT,
                 required_version TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        # 兼容已有 app.db：CREATE TABLE IF NOT EXISTS 不会自动补新列。
+        cols = {row["name"] for row in cur.execute("PRAGMA table_info(submissions)").fetchall()}
+        if "next_attempt_at" not in cols:
+            cur.execute("ALTER TABLE submissions ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0")
         cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
                 user_id INTEGER PRIMARY KEY,
                 balance REAL NOT NULL DEFAULT 100.0)""")
@@ -206,9 +211,12 @@ def get_task(sid):
 
 
 def find_pending_id():
-    """只挑 id，不改状态（状态变更统一走 state_machine）"""
+    """只挑已到重试时间的 pending id，不改状态（状态变更统一走 state_machine）。"""
     with POOL.connection() as con:
-        row = con.execute("SELECT id FROM submissions WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        row = con.execute(
+            "SELECT id FROM submissions WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT 1",
+            (time.time(),),
+        ).fetchone()
     return row["id"] if row else None
 
 
