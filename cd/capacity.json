@@ -1,0 +1,69 @@
+{
+  "ts": "2026-09-14 14:59:46",
+  "host": {
+    "cores": 4,
+    "mem_total_mb": 3723.2,
+    "mem_available_mb": 2840.9
+  },
+  "workload": {
+    "task_ms": 500.0,
+    "avg_retry": 1.0,
+    "amplify": 2.0,
+    "samples": 14
+  },
+  "params": {
+    "USERS": 10000,
+    "WINDOW_MIN": 60.0,
+    "SAFETY": 2.0,
+    "TARGET_UTIL": 0.7,
+    "THREADS_PER_WORKER": 4,
+    "MAX_WORKERS": 6,
+    "MEM_HEADROOM": 0.75,
+    "CPU_TARGET": 0.7,
+    "CPU_PER_TASK_RATIO": 0.05,
+    "DB_MAX_CONCURRENCY": 32,
+    "RESERVED_MB": 512.0
+  },
+  "demand": {
+    "arrival_rps": 2.778,
+    "arrival_with_retry_rps": 5.556,
+    "concurrency_needed": 7.94
+  },
+  "ceiling": {
+    "by_memory": 296,
+    "by_cpu": 112.0,
+    "by_db": 32,
+    "effective": 32,
+    "worker_budget_mb": 1674.7,
+    "per_worker_mb": 22.6
+  },
+  "plan": {
+    "concurrency": 8,
+    "workers": 2,
+    "threads_per_worker": 4,
+    "real_concurrency": 8,
+    "switch": "开启多线程多任务：2 个 worker 实例 × 4 线程",
+    "est_memory_mb": 141.2,
+    "est_cpu_percent": 5.0
+  },
+  "scaling": {
+    "scale_up_when": "queue_depth 持续 > 并发数（任务排队）且 CPU < 70%、内存 < 75%",
+    "scale_down_when": "queue_depth 长时间为 0 且 CPU < 20%",
+    "never_exceed": "workers <= 6，总并发 <= 32（内存/CPU/DB 三者取小）"
+  },
+  "apply": {
+    "executed": false,
+    "current_workers": [
+      1,
+      2,
+      3
+    ],
+    "actions": [
+      "写 drop-in /etc/systemd/system/screenshot-worker@.service.d/threads.conf -> WORKER_THREADS=4",
+      "systemctl daemon-reload",
+      "systemctl restart screenshot-worker@1（应用新线程数并拉起）",
+      "systemctl restart screenshot-worker@2（应用新线程数并拉起）",
+      "systemctl stop screenshot-worker@3（超出预算，回收）"
+    ]
+  }
+}
