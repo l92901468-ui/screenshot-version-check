@@ -98,7 +98,26 @@ class TestDb(Base):
         sid = self.new_task()
         self.assertEqual(db.find_pending_id(), sid)
 
+    def test_find_pending_respects_next_attempt_at(self):
+        sid = self.new_task()
+        db.update_task(sid, "pending", {"next_attempt_at": time.time() + 60})
+        self.assertIsNone(db.find_pending_id(), "未到 next_attempt_at 的 retry 不应被 worker 提前领取")
+        db.update_task(sid, "pending", {"next_attempt_at": time.time() - 1})
+        self.assertEqual(db.find_pending_id(), sid)
 
+
+class TestRetryJitter(unittest.TestCase):
+    def test_full_jitter_within_exponential_cap(self):
+        import worker
+        old_base, old_max = worker.RETRY_BASE_SEC, worker.RETRY_MAX_SEC
+        try:
+            worker.RETRY_BASE_SEC = 1.0
+            worker.RETRY_MAX_SEC = 30.0
+            for retry_count, cap in ((1, 1.0), (2, 2.0), (3, 4.0), (10, 30.0)):
+                samples = [worker.retry_delay(retry_count) for _ in range(50)]
+                self.assertTrue(all(0.0 <= x <= cap for x in samples))
+        finally:
+            worker.RETRY_BASE_SEC, worker.RETRY_MAX_SEC = old_base, old_max
 
 
 class TestConnectionPool(Base):
