@@ -1,0 +1,33 @@
+# 容器编排（本地/测试用；生产目前仍由 systemd 跑，端口 9001 避免和现网 8001 冲突）
+services:
+  api1:
+    build: .
+    command: python3 app.py
+    environment:
+      PORT: "8001"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+    ports: ["9001:8001"]
+    volumes: ["data:/data"]
+
+  worker1:
+    build: .
+    command: python3 worker.py
+    environment:
+      WORKER_ID: "1"
+      WORKER_THREADS: "4"
+      DB_PATH: /data/app.db
+      UPLOAD_DIR: /data/uploads
+    volumes: ["data:/data"]
+
+  healthd:
+    build: .
+    command: python3 healthd.py
+    environment:
+      HEALTH_INTERVAL: "30"
+      DB_PATH: /data/app.db
+    volumes: ["data:/data"]
+
+volumes:
+  data:

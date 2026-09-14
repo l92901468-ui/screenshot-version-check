@@ -1,0 +1,9 @@
+.git
+logs/
+uploads/
+__pycache__/
+*.pyc
+app.db
+app.db-wal
+app.db-shm
+ssl/
