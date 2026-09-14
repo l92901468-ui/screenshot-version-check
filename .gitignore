@@ -7,3 +7,4 @@ app.db-wal
 app.db-shm
 ssl/
 .deployed_version
+ci/reports/
