@@ -1,4 +1,4 @@
-import os, time, threading
+import os, random, time, threading
 
 import db, logutil, billing, recognize
 import state_machine as sm
@@ -7,8 +7,16 @@ WORKER_ID = os.environ.get("WORKER_ID", "1")
 NAME = f"worker-{WORKER_ID}"
 THREADS = int(os.environ.get("WORKER_THREADS", "4"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "0.5"))
+RETRY_BASE_SEC = float(os.environ.get("RETRY_BASE_SEC", "1.0"))
+RETRY_MAX_SEC = float(os.environ.get("RETRY_MAX_SEC", "30.0"))
 
 log = logutil.setup(NAME)
+
+
+def retry_delay(retry_count: int) -> float:
+    """指数退避 + full jitter：随机落在 [0, cap]，避免多个失败任务同时重试形成 retry storm。"""
+    cap = min(RETRY_MAX_SEC, RETRY_BASE_SEC * (2 ** max(0, retry_count - 1)))
+    return random.uniform(0.0, cap)
 
 
 def handle_one(tid: str):
@@ -17,7 +25,7 @@ def handle_one(tid: str):
     if sid is None:
         return False
 
-    if not sm.transition(sid, "processing"):
+    if not sm.transition(sid, "processing", next_attempt_at=0):
         log.info(f"[{tid}] 领取失败 sid={sid}（已被其他 worker 抢走）")
         return True
 
@@ -46,8 +54,13 @@ def handle_one(tid: str):
             sm.transition(sid, "dlq", retry_count=rc, result_msg=msg)
             log.error(f"[{tid}] sid={sid} 识别失败 retry={rc}/{db.MAX_RETRY} -> DLQ 待人工审核（{msg}）")
         else:
-            sm.transition(sid, "pending", retry_count=rc, result_msg=msg)
-            log.warning(f"[{tid}] sid={sid} 识别失败 retry={rc}/{db.MAX_RETRY} -> 回队列等待重试（{msg}）")
+            delay = retry_delay(rc)
+            next_attempt_at = time.time() + delay
+            sm.transition(sid, "pending", retry_count=rc, next_attempt_at=next_attempt_at, result_msg=msg)
+            log.warning(
+                f"[{tid}] sid={sid} 识别失败 retry={rc}/{db.MAX_RETRY} -> "
+                f"指数退避+full jitter {delay:.2f}s 后重试（{msg}）"
+            )
         return True
 
     # 识别成功：扣费 + 机械核验版本
@@ -72,7 +85,7 @@ def recover_arrears(tid: str):
         return
     row = db.get_task(sid)
     if row and not billing.is_arrears(row["user_id"]):
-        sm.transition(sid, "pending", result_msg="余额已恢复，重新入队")
+        sm.transition(sid, "pending", next_attempt_at=0, result_msg="余额已恢复，重新入队")
         log.info(f"[{tid}] sid={sid} 余额已恢复 -> 重新入队")
 
 
@@ -89,7 +102,10 @@ def loop(tid: str):
 
 def main():
     db.init_db()
-    log.info(f"{NAME} 启动 | 并发线程={THREADS} | retry上限={db.MAX_RETRY} | 要求版本={recognize.REQUIRED_VERSION}")
+    log.info(
+        f"{NAME} 启动 | 并发线程={THREADS} | retry上限={db.MAX_RETRY} | "
+        f"退避基数={RETRY_BASE_SEC}s 上限={RETRY_MAX_SEC}s | 要求版本={recognize.REQUIRED_VERSION}"
+    )
     threads = [threading.Thread(target=loop, args=(f"{NAME}-t{i}",), daemon=True) for i in range(THREADS)]
     for t in threads:
         t.start()
