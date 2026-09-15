@@ -15,12 +15,16 @@ def get_balance(user_id) -> float:
 
 
 def is_arrears(user_id) -> bool:
-    """余额 <= 0 即视为欠费"""
+    """余额 <= 0 即视为欠费。"""
     return get_balance(user_id) <= 0
 
 
 def charge(user_id, cost: float = COST_PER_CALL) -> float:
-    """扣费，返回扣后余额"""
+    """独立扣费 helper，返回扣后余额。
+
+    worker 的成功路径不直接调用这里：它使用 db.finalize_processing_and_charge()，
+    把 fencing 校验、processing -> done 和本地扣费放在同一事务，避免 stale worker 重复扣费。
+    """
     import db
     con = db.connect()
     cur = con.cursor()
