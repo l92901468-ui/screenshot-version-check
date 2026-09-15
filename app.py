@@ -15,7 +15,8 @@ log = logutil.setup(NAME)
 # 这个 API 实例不保存任何会话状态，任何请求落到任何一个实例结果都一样：
 #   1. 认证：Bearer token 自包含（uid + 过期时间 + HMAC 签名），服务端不存 session
 #   2. 业务状态：一律在 DB（结构化状态）和对象存储（大文件），进程重启即丢的东西不算状态
-#   3. 幂等：靠 DB 唯一索引 (user_id, idempotency_key)，跨实例共享
+#   3. 幂等：先在 DB 持久化 (user_id, idempotency_key, file_hash, uploading)，再做对象存储副作用；
+#            同一 submission 使用稳定 object key，跨实例重试可恢复，不靠进程内 session
 # 下面两样是可随时丢弃的本地加速件，丢了只影响性能不影响正确性：
 #   - CACHE：DB 的只读副本，可用 CACHE_ENABLED=0 整个关掉
 #   - metrics 的请求延时滑动窗口：进程内观测值，不是权威指标（权威指标由 DB 派生）
@@ -65,7 +66,7 @@ def read_task(sid):
         CACHE.set(sid, payload)
         return payload, "db(冲突以DB为准)" if conflict else "cache(已核对)"
 
-    # 只把终态放进缓存：pending/processing 每次回源，
+    # 只把终态放进缓存：uploading/pending/processing 每次回源，
     # 否则同一个任务在不同实例上可能返回不同的中间状态，破坏无状态假设
     if payload["status"] in TERMINAL_STATES:
         CACHE.set(sid, payload)
@@ -105,6 +106,87 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             log.warning(f"权限拒绝 token 无效（{e}）{self.command} {self.path}")
             return None, err("relogin", 401, str(e))
+
+    def _send_idempotency_conflict(self, sid=None):
+        msg = "同一个 Idempotency-Key 已用于不同文件；请为新的业务请求使用新的 key"
+        log.warning(f"幂等键复用但请求内容不同 sid={sid}")
+        return self._send(409, {"ok": False, "action": "new_idempotency_key", "msg": msg})
+
+    def _replay_submission(self, row):
+        """重放一个已经持久化的 submission，不依赖当前 API 实例内存。"""
+        headers = {"Idempotency-Replayed": "true"}
+        if row["status"] == "rejected":
+            return self._send(
+                400,
+                {"ok": False, "action": "relogin", "msg": row.get("result_msg") or "提交被拒绝"},
+                headers,
+            )
+        return self._send(
+            200,
+            {"ok": True, "action": "success",
+             "submission_id": row["id"],
+             "status": row["status"],
+             "status_text": sm.STATES.get(row["status"], row["status"])},
+            headers,
+        )
+
+    def _complete_or_recover_upload(self, row, file_bytes, filename, file_hash, created):
+        """把 uploading submission 推进到 pending；crash 后由相同请求恢复。
+
+        created=True 表示本请求刚刚成功 reserve，持有当前 upload lease。
+        created=False 时：
+          1. 如果稳定 object key 已存在且 hash 一致，说明之前已经完整落盘，只差 DB 状态推进；
+          2. 如果对象不存在，只允许 lease 过期后的一个请求原子 claim 后重写。
+        """
+        sid = row["id"]
+        object_key = object_store.make_object_key(sid)
+
+        if not created:
+            stored_hash = object_store.object_hash(object_key)
+            if stored_hash is not None:
+                if stored_hash != file_hash:
+                    log.error(f"对象内容与幂等指纹冲突 sid={sid} key={object_key}")
+                    return self._send(*err("pause", 500, "对象存储内容与任务指纹不一致，请人工检查"))
+                meta = {"key": object_key, "path": object_store.object_path(object_key), "hash": stored_hash}
+                if sm.transition(sid, "pending", object_key=meta["key"], object_path=meta["path"],
+                                 file_hash=meta["hash"], upload_lease_until=0, result_msg=None):
+                    log.info(f"上传恢复 sid={sid}: 对象已完整存在，仅补推进 uploading -> pending")
+                return self._replay_submission(db.get_task(sid))
+
+            if not db.claim_stale_upload(sid, file_hash):
+                # 原请求仍在 lease 内，避免两个 API 实例同时写同一个对象。
+                log.info(f"幂等重放 sid={sid}: 上传仍进行中，等待当前 lease 完成")
+                return self._replay_submission(db.get_task(sid))
+            log.warning(f"上传恢复 sid={sid}: lease 已过期且对象不存在 -> 当前实例接管重写")
+
+        try:
+            meta = object_store.put_object(file_bytes, filename, key=object_key)
+            log.info(f"对象存储落盘 sid={sid} key={meta['key']} hash={meta['hash'][:12]}...")
+            if meta["hash"] != file_hash:
+                raise RuntimeError("对象写入后的 hash 与请求指纹不一致")
+            if not sm.transition(sid, "pending", object_key=meta["key"], object_path=meta["path"],
+                                 file_hash=meta["hash"], upload_lease_until=0, result_msg=None):
+                # 可能被另一个恢复请求先推进；读取 DB 后按权威状态重放。
+                current = db.get_task(sid)
+                if current and current["status"] != "uploading":
+                    return self._replay_submission(current)
+                raise RuntimeError("上传完成但状态无法推进到 pending")
+        except Exception:
+            # 不删除 reservation：它正是 crash/retry 的持久化恢复点。
+            # 释放 lease 让下一次相同请求可以立即接管；对象使用稳定 key，不会制造新的 orphan final object。
+            db.update_task(sid, "uploading",
+                           {"upload_lease_until": 0, "result_msg": "对象写入未完成，等待相同请求重试恢复"})
+            raise
+
+        current = db.get_task(sid)
+        log.info(f"任务已创建 sid={sid} status=pending（等待 worker 识别）")
+        headers = {"Idempotency-Replayed": "true"} if not created else None
+        return self._send(
+            200,
+            {"ok": True, "action": "success", "submission_id": sid,
+             "status": current["status"], "status_text": sm.STATES.get(current["status"], current["status"])},
+            headers,
+        )
 
     def do_POST(self):
         self._start()
@@ -151,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
         log.info(f"账号登录成功 uid={uid} username={username} -> 签发 token")
         self._send(200, {"ok": True, "token": auth_token.issue_token(uid)})
 
-    # ---------- 提交：建任务，返回等待中 ----------
+    # ---------- 提交：先持久化幂等 reservation，再写对象，最后进入 pending ----------
     def handle_submit(self):
         uid, e = self._auth()
         if e:
@@ -167,18 +249,6 @@ class Handler(BaseHTTPRequestHandler):
         log.info(f"幂等检查 uid={uid} key={idem_key or '(缺失)'}")
         if not idem_key:
             return self._send(*err("relogin", 400, "缺少 Idempotency-Key 头（重复提交请用同一个 key）"))
-        existing = db.find_by_idempotency(uid, idem_key)
-        if existing:
-            log.info(f"幂等命中 uid={uid} key={idem_key} -> 重放 sid={existing['id']} 状态={existing['status']}")
-            if existing["status"] == "rejected":
-                return self._send(400, {"ok": False, "action": "relogin", "msg": existing["result_msg"] or "提交被拒绝"},
-                                  {"Idempotency-Replayed": "true"})
-            return self._send(200, {"ok": True, "action": "success",
-                                    "submission_id": existing["id"],
-                                    "status": existing["status"],
-                                    "status_text": sm.STATES.get(existing["status"], existing["status"])},
-                              {"Idempotency-Replayed": "true"})
-        log.info(f"幂等未命中 uid={uid} key={idem_key} -> 走正常流程")
 
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):
@@ -190,35 +260,48 @@ class Handler(BaseHTTPRequestHandler):
         item = form["file"]
         file_bytes = item.file.read()
         filename = item.filename or "upload.bin"
-        log.info(f"收到文件 uid={uid} 文件名={filename} 大小={len(file_bytes)}字节")
+        file_hash = object_store.hash_bytes(file_bytes)
+        log.info(f"收到文件 uid={uid} 文件名={filename} 大小={len(file_bytes)}字节 hash={file_hash[:12]}...")
+
+        # 必须拿到 body fingerprint 后再做幂等重放判断：
+        # 同一个 key 如果带了不同文件，不能悄悄把旧结果当成新请求成功返回。
+        existing = db.find_by_idempotency(uid, idem_key)
+        if existing:
+            if existing.get("file_hash") and existing["file_hash"] != file_hash:
+                return self._send_idempotency_conflict(existing["id"])
+            log.info(f"幂等命中 uid={uid} key={idem_key} -> sid={existing['id']} 状态={existing['status']}")
+            if existing["status"] == "uploading":
+                try:
+                    return self._complete_or_recover_upload(
+                        existing, file_bytes, filename, file_hash, created=False
+                    )
+                except Exception as ex:
+                    log.exception(f"上传恢复异常 uid={uid} sid={existing['id']}")
+                    return self._send(*err("pause", 500, f"服务端错误: {ex}"))
+            return self._replay_submission(existing)
 
         ok, msg = validate.validate_file(file_bytes, filename)
         log.info(f"文件校验 uid={uid} 结果={'通过' if ok else '不通过'} {msg}")
         if not ok:
-            db.insert_rejected(uid, idem_key, msg)
+            try:
+                db.insert_rejected(uid, idem_key, msg, file_hash=file_hash)
+            except sqlite3.IntegrityError:
+                row = db.find_by_idempotency(uid, idem_key)
+                if row and row.get("file_hash") and row["file_hash"] != file_hash:
+                    return self._send_idempotency_conflict(row["id"])
             log.warning(f"文件校验失败 uid={uid} -> 记为 rejected（{msg}）")
             return self._send(*err("relogin", 400, msg))
 
         try:
-            meta = object_store.put_object(file_bytes, filename)
-            log.info(f"对象存储落盘 uid={uid} key={meta['key']} hash={meta['hash'][:12]}...")
-            sid = db.insert_task(uid, idem_key, meta, status="pending")
-        except sqlite3.IntegrityError:
-            row = db.find_by_idempotency(uid, idem_key)
-            log.warning(f"并发幂等冲突 uid={uid} key={idem_key} -> 重放")
-            if row:
-                return self._send(200, {"ok": True, "action": "success", "submission_id": row["id"],
-                                        "status": row["status"],
-                                        "status_text": sm.STATES.get(row["status"], row["status"])},
-                                  {"Idempotency-Replayed": "true"})
-            return self._send(*err("pause", 500, "并发幂等冲突"))
+            row, created = db.reserve_upload(uid, idem_key, file_hash)
+            if row.get("file_hash") and row["file_hash"] != file_hash:
+                return self._send_idempotency_conflict(row["id"])
+            if not created and row["status"] != "uploading":
+                return self._replay_submission(row)
+            return self._complete_or_recover_upload(row, file_bytes, filename, file_hash, created=created)
         except Exception as ex:
             log.exception(f"提交处理异常 uid={uid}")
             return self._send(*err("pause", 500, f"服务端错误: {ex}"))
-
-        log.info(f"任务已创建 sid={sid} uid={uid} status=pending（等待 worker 识别）")
-        self._send(200, {"ok": True, "action": "success", "submission_id": sid,
-                         "status": "pending", "status_text": "等待中"})
 
     # ---------- 查询任务状态 ----------
     def handle_status(self, path):
