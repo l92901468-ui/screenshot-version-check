@@ -29,6 +29,22 @@ def uses_external_api() -> bool:
     return backend_name() == "external"
 
 
+def is_external_control_block(message: str) -> bool:
+    """外部 provider 被安全控制面阻断时，不应消耗业务识别 retry 次数。
+
+    这些错误表示“当前不允许/不能调用供应商”，不是截图本身识别失败：
+    - token incident 主动 pause；
+    - secret 未配置；
+    - credential generation 已过期（401）。
+    """
+    text = str(message or "")
+    return text.startswith((
+        "external provider paused",
+        "external provider token missing",
+        "external provider 401",
+    ))
+
+
 def call_internal_model(sid: int, retry_count: int):
     """内部识图模型模拟。
 
