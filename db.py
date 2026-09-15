@@ -140,7 +140,16 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL)""")
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                token_version INTEGER NOT NULL DEFAULT 1)""")
+        # 兼容旧 app.db：账号状态和 token version 是后加的列。
+        user_cols = {row["name"] for row in cur.execute("PRAGMA table_info(users)").fetchall()}
+        if "is_active" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        if "token_version" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1")
+
         cur.execute("""CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -172,11 +181,64 @@ def init_db():
 
 
 def verify_user(username: str, password: str):
+    """校验登录凭据；disabled account 即使密码正确也不能重新登录。"""
     with POOL.connection() as con:
-        row = con.execute("SELECT id, password_hash FROM users WHERE username=?", (username,)).fetchone()
-    if row and row["password_hash"] == hashlib.sha256(password.encode()).hexdigest():
+        row = con.execute(
+            "SELECT id, password_hash, is_active FROM users WHERE username=?",
+            (username,),
+        ).fetchone()
+    if (
+        row
+        and row["is_active"]
+        and row["password_hash"] == hashlib.sha256(password.encode()).hexdigest()
+    ):
         return row["id"]
     return None
+
+
+def get_user_auth_state(user_id: int):
+    """共享认证状态；每次 token 验证直接读这里，不做本地 TTL 缓存。"""
+    with POOL.connection() as con:
+        row = con.execute(
+            "SELECT id, is_active, token_version FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_user_active(user_id: int, is_active: bool) -> bool:
+    """启用/禁用账号。
+
+    disable 时同时 bump token_version，让禁用前签发的 token 在之后重新启用账号时也不会复活。
+    """
+    with POOL.connection() as con:
+        cur = con.cursor()
+        if is_active:
+            cur.execute("UPDATE users SET is_active=1 WHERE id=?", (user_id,))
+        else:
+            cur.execute(
+                """UPDATE users
+                   SET is_active=0,
+                       token_version=CASE WHEN is_active!=0 THEN token_version+1 ELSE token_version END
+                   WHERE id=?""",
+                (user_id,),
+            )
+        changed = cur.rowcount == 1
+        con.commit()
+    return changed
+
+
+def revoke_user_tokens(user_id: int) -> bool:
+    """账号保持启用，但让此前签发的所有 token 立即失效。"""
+    with POOL.connection() as con:
+        cur = con.cursor()
+        cur.execute(
+            "UPDATE users SET token_version=token_version+1 WHERE id=?",
+            (user_id,),
+        )
+        changed = cur.rowcount == 1
+        con.commit()
+    return changed
 
 
 def find_by_idempotency(user_id, key):
