@@ -4,11 +4,13 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import db
 import state_machine as sm
+import worker
 
 
 class WorkerOwnershipBase(unittest.TestCase):
@@ -181,6 +183,78 @@ class TestWorkerOwnership(WorkerOwnershipBase):
         self.assertIn("processing_owner", cols)
         self.assertIn("processing_generation", cols)
         self.assertIn("processing_lease_until", cols)
+
+
+class TestHeartbeatOwnershipUncertainty(WorkerOwnershipBase):
+    def _claimed_heartbeat(self):
+        sid = self.new_task()
+        row = db.claim_next_task("worker-a", 5.0)
+        return sid, row["processing_generation"], worker.ProcessingLeaseHeartbeat(
+            sid, "worker-a", row["processing_generation"]
+        )
+
+    def test_db_error_marks_uncertain_but_not_lost(self):
+        _, _, heartbeat = self._claimed_heartbeat()
+        with mock.patch.object(
+            db, "renew_processing_lease", side_effect=RuntimeError("temporary db outage")
+        ):
+            self.assertEqual(heartbeat.renew_once(), "uncertain")
+        self.assertTrue(heartbeat.uncertain.is_set())
+        self.assertFalse(heartbeat.lost.is_set())
+
+    def test_later_success_clears_uncertainty(self):
+        _, _, heartbeat = self._claimed_heartbeat()
+        with mock.patch.object(
+            db,
+            "renew_processing_lease",
+            side_effect=[RuntimeError("temporary db outage"), True],
+        ):
+            self.assertEqual(heartbeat.renew_once(), "uncertain")
+            self.assertTrue(heartbeat.uncertain.is_set())
+            self.assertEqual(heartbeat.renew_once(), "renewed")
+        self.assertFalse(heartbeat.uncertain.is_set())
+        self.assertFalse(heartbeat.lost.is_set())
+
+    def test_authoritative_renewal_rejection_marks_lost(self):
+        _, _, heartbeat = self._claimed_heartbeat()
+        with mock.patch.object(db, "renew_processing_lease", return_value=False):
+            self.assertEqual(heartbeat.renew_once(), "lost")
+        self.assertTrue(heartbeat.lost.is_set())
+        self.assertFalse(heartbeat.uncertain.is_set())
+
+    def test_uncertain_worker_still_attempts_fenced_finalize(self):
+        sid = self.new_task()
+
+        class UncertainHeartbeat:
+            def __init__(self, *_args, **_kwargs):
+                self.lost = threading.Event()
+                self.uncertain = threading.Event()
+                self.uncertain.set()
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(worker, "ProcessingLeaseHeartbeat", UncertainHeartbeat), \
+             mock.patch.object(
+                 worker.recognize,
+                 "call_vision_model",
+                 return_value=(True, "10.0.19045", "ok"),
+             ):
+            self.assertTrue(worker.handle_one("worker-a"))
+
+        row = db.get_task(sid)
+        self.assertEqual(row["status"], "done")
+        con = db.connect()
+        try:
+            balance = con.execute(
+                "SELECT balance FROM accounts WHERE user_id=1"
+            ).fetchone()["balance"]
+        finally:
+            con.close()
+        self.assertEqual(balance, 99.0)
 
 
 if __name__ == "__main__":

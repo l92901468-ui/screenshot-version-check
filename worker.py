@@ -36,8 +36,12 @@ def retry_delay(retry_count: int) -> float:
 class ProcessingLeaseHeartbeat:
     """独立 heartbeat，防止长时间模型调用期间 processing lease 自然过期。
 
-    heartbeat 一旦无法续租，就把当前 worker 标记为 lost owner；后续结果必须丢弃。
-    即使 lost 标志因竞态没及时看到，最终数据库写仍有 generation/owner/lease fencing。
+    `renew_processing_lease()` 明确返回 False 时，DB 已经给出了权威答案：当前
+    owner/generation/lease 已不再有效，因此标记为 `lost` 并停止续租。
+
+    如果只是 DB 异常/超时，则本地无法判断 lease 是否仍然有效。这种情况只标记为
+    `uncertain`，继续重试 heartbeat；后续副作用仍交给数据库里的 owner + generation +
+    live lease fencing 做最终裁决。这样不会因为一次短暂 DB 抖动就无条件丢弃模型结果。
     """
 
     def __init__(self, sid: int, owner: str, generation: int):
@@ -46,6 +50,7 @@ class ProcessingLeaseHeartbeat:
         self.generation = generation
         self._stop = threading.Event()
         self.lost = threading.Event()
+        self.uncertain = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"lease-{sid}-g{generation}",
@@ -55,27 +60,45 @@ class ProcessingLeaseHeartbeat:
     def start(self):
         self._thread.start()
 
+    def renew_once(self):
+        """执行一次 heartbeat，返回 renewed / uncertain / lost。"""
+        try:
+            renewed = db.renew_processing_lease(
+                self.sid,
+                self.owner,
+                self.generation,
+                PROCESSING_LEASE_SEC,
+            )
+        except Exception:
+            # DB 不可用并不等价于 ownership 已丢失；只能说明当前无法证明。
+            self.uncertain.set()
+            log.exception(
+                f"lease heartbeat 异常 sid={self.sid} gen={self.generation} owner={self.owner}；"
+                "ownership 暂时不确定，将继续重试并让 fenced DB write 做最终裁决"
+            )
+            return "uncertain"
+
+        if not renewed:
+            # DB 已可达且 fenced renewal 明确失败：当前 lease 已失效/被接管。
+            self.lost.set()
+            self.uncertain.clear()
+            log.warning(
+                f"lease 续租被拒绝 sid={self.sid} gen={self.generation} owner={self.owner}，"
+                "当前 worker 已确定失去 ownership"
+            )
+            return "lost"
+
+        if self.uncertain.is_set():
+            log.info(
+                f"lease heartbeat 恢复 sid={self.sid} gen={self.generation} owner={self.owner}，"
+                "ownership 已重新确认"
+            )
+        self.uncertain.clear()
+        return "renewed"
+
     def _run(self):
         while not self._stop.wait(PROCESSING_HEARTBEAT_SEC):
-            try:
-                if not db.renew_processing_lease(
-                    self.sid,
-                    self.owner,
-                    self.generation,
-                    PROCESSING_LEASE_SEC,
-                ):
-                    self.lost.set()
-                    log.warning(
-                        f"lease 续租失败 sid={self.sid} gen={self.generation} owner={self.owner}，"
-                        "当前 worker 已失去 ownership"
-                    )
-                    return
-            except Exception:
-                # 无法证明 ownership 仍然有效时按 fail-closed 处理：不允许本 worker 提交结果。
-                self.lost.set()
-                log.exception(
-                    f"lease heartbeat 异常 sid={self.sid} gen={self.generation} owner={self.owner}"
-                )
+            if self.renew_once() == "lost":
                 return
 
     def stop(self):
@@ -87,7 +110,14 @@ class ProcessingLeaseHeartbeat:
 def _stale_result(tid: str, sid: int, generation: int, where: str):
     log.warning(
         f"[{tid}] 丢弃 stale worker 结果 sid={sid} gen={generation} stage={where} "
-        "（lease 已丢失或任务已被新 generation 接管）"
+        "（lease 已失效或任务已被新 generation 接管）"
+    )
+
+
+def _log_uncertain_commit(tid: str, sid: int, generation: int, where: str):
+    log.warning(
+        f"[{tid}] ownership 暂时不确定 sid={sid} gen={generation} stage={where}；"
+        "不根据本地 heartbeat 状态直接丢结果，交给 fenced DB write 最终裁决"
     )
 
 
@@ -113,6 +143,11 @@ def handle_one(tid: str):
         # 欠费：不消耗 retry，fenced 地转 arrears。
         balance = billing.get_balance(uid)
         if billing.is_arrears(uid):
+            if heartbeat.lost.is_set():
+                _stale_result(tid, sid, generation, "arrears")
+                return True
+            if heartbeat.uncertain.is_set():
+                _log_uncertain_commit(tid, sid, generation, "arrears")
             if not sm.transition_owned(
                 sid,
                 "arrears",
@@ -143,6 +178,8 @@ def handle_one(tid: str):
         if heartbeat.lost.is_set():
             _stale_result(tid, sid, generation, "after_model")
             return True
+        if heartbeat.uncertain.is_set():
+            _log_uncertain_commit(tid, sid, generation, "after_model")
 
         if not ok:
             new_rc = rc + 1
@@ -188,7 +225,6 @@ def handle_one(tid: str):
             if passed
             else f"核验未通过：识别版本 {version} < 要求 {recognize.REQUIRED_VERSION}"
         )
-        before = billing.get_balance(uid)
         finalized, after = sm.finalize_done_owned(
             sid,
             tid,
@@ -203,7 +239,7 @@ def handle_one(tid: str):
             return True
 
         log.info(
-            f"[{tid}] sid={sid} gen={generation} 扣费 {billing.COST_PER_CALL} -> 余额 {before} => {after}"
+            f"[{tid}] sid={sid} gen={generation} 完成原子扣费 {billing.COST_PER_CALL} -> 余额 {after}"
         )
         log.info(
             f"[{tid}] sid={sid} gen={generation} 版本核验 {'通过' if passed else '未通过'} -> {verdict} "
