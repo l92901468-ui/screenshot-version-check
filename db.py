@@ -176,6 +176,19 @@ def init_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
                 user_id INTEGER PRIMARY KEY,
                 balance REAL NOT NULL DEFAULT 100.0)""")
+        # 兼容旧库不能直接补 CHECK constraint，因此用 trigger 把 balance >= 0 作为数据库 invariant。
+        cur.execute("""CREATE TRIGGER IF NOT EXISTS accounts_nonnegative_insert
+                       BEFORE INSERT ON accounts
+                       WHEN NEW.balance < 0
+                       BEGIN
+                           SELECT RAISE(ABORT, 'account balance cannot be negative');
+                       END""")
+        cur.execute("""CREATE TRIGGER IF NOT EXISTS accounts_nonnegative_update
+                       BEFORE UPDATE OF balance ON accounts
+                       WHEN NEW.balance < 0
+                       BEGIN
+                           SELECT RAISE(ABORT, 'account balance cannot be negative');
+                       END""")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uniq_user_idem ON submissions(user_id, idempotency_key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_claim ON submissions(status, next_attempt_at, processing_lease_until, id)")
         cur.execute("INSERT OR IGNORE INTO users(username, password_hash) VALUES(?, ?)",
@@ -351,7 +364,6 @@ def claim_next_task(owner: str, lease_sec: float = PROCESSING_LEASE_SEC):
 
     with POOL.connection() as con:
         cur = con.cursor()
-        # SELECT 只是候选发现；真正 ownership 由下面带旧 generation 的 UPDATE 决定。
         row = cur.execute(
             """SELECT id, status, processing_generation
                FROM submissions
@@ -445,10 +457,14 @@ def update_processing_owned(sid: int, owner: str, generation: int, fields: dict)
 
 def finalize_processing_and_charge(sid: int, owner: str, generation: int,
                                    cost: float, fields: dict):
-    """把 fenced processing -> done 与本地扣费放在同一 SQLite 事务。
+    """把 fenced processing -> done 与外部 API 模拟扣费放在同一 SQLite 事务。
 
-    stale worker 的 generation/owner/lease 任一不匹配时，任务状态和余额都不会改变。
-    返回 (ok, balance_after)。
+    `cost=0`（内部模型）时不访问 accounts；外部 API 模式则使用条件扣费
+    `balance >= cost`，因此两个任务即使都基于旧余额通过预检查，最终也只能有一个
+    消耗最后一份额度。任务状态更新与扣费在同一事务，扣费失败会回滚 done。
+
+    stale worker 的 generation/owner/lease 任一不匹配时也不会产生副作用。
+    返回 (ok, balance_after)；额度不足时 ok=False，balance_after 返回当前额度（若有）。
     """
     allowed = {"detected_version", "required_version", "result_msg"}
     data = {k: fields[k] for k in fields if k in allowed}
@@ -479,19 +495,30 @@ def finalize_processing_and_charge(sid: int, owner: str, generation: int,
             con.rollback()
             return False, None
 
-        cur.execute(
-            "UPDATE accounts SET balance=balance-? WHERE user_id=?",
-            (cost, owner_row["user_id"]),
-        )
-        if cur.rowcount != 1:
-            con.rollback()
-            raise RuntimeError("任务完成但找不到对应账户，已回滚")
-        balance_row = cur.execute(
-            "SELECT balance FROM accounts WHERE user_id=?",
-            (owner_row["user_id"],),
-        ).fetchone()
+        balance_after = None
+        if cost > 0:
+            cur.execute(
+                """UPDATE accounts
+                   SET balance=balance-?
+                   WHERE user_id=? AND balance>=?""",
+                (cost, owner_row["user_id"], cost),
+            )
+            if cur.rowcount != 1:
+                # 回滚 processing -> done；然后读取当前额度给调用方判断 arrears。
+                con.rollback()
+                row = con.execute(
+                    "SELECT balance FROM accounts WHERE user_id=?",
+                    (owner_row["user_id"],),
+                ).fetchone()
+                return False, (float(row["balance"]) if row else None)
+            balance_row = cur.execute(
+                "SELECT balance FROM accounts WHERE user_id=?",
+                (owner_row["user_id"],),
+            ).fetchone()
+            balance_after = float(balance_row["balance"])
+
         con.commit()
-        return True, float(balance_row["balance"])
+        return True, balance_after
 
 
 def find_arrears_id():
