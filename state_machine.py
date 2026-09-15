@@ -31,11 +31,11 @@ def can_transition(curr: str, nxt: str) -> bool:
 
 
 def transition(sid, to: str, **fields) -> bool:
-    """普通状态转换入口。
+    """非 worker-ownership 状态转换入口。
 
-    worker 的 processing ownership 不允许靠这个函数判断；processing 出边必须使用
-    transition_owned/finalize_done_owned。same-state 也不再返回成功，避免“别人已经 claim
-    了 processing，我也把 processing 当作自己 claim 成功”的歧义。
+    pending -> processing 只能通过 db.claim_next_task() 原子领取；processing 出边只能走
+    transition_owned/finalize_done_owned。same-state 不再返回成功，避免把“别人已经完成的
+    状态”误认成“我自己的操作成功”。
     """
     row = db.get_task(sid)
     if row is None:
@@ -46,8 +46,10 @@ def transition(sid, to: str, **fields) -> bool:
     if curr == to:
         log.warning(f"状态转换拒绝 same-state sid={sid} status={curr}")
         return False
-    if curr == "processing":
-        log.error(f"processing 状态必须使用 fenced transition sid={sid} -> {to}")
+    if curr == "processing" or to == "processing":
+        log.error(
+            f"processing ownership 必须使用 claim/fenced API sid={sid} {curr} -> {to}"
+        )
         return False
     if not can_transition(curr, to):
         log.error(f"非法状态转换已拒绝 sid={sid} {curr}({STATES.get(curr)}) -> {to}({STATES.get(to)})")
@@ -65,6 +67,9 @@ def transition(sid, to: str, **fields) -> bool:
 
 def transition_owned(sid: int, to: str, owner: str, generation: int, **fields) -> bool:
     """worker processing 出边：owner + generation + 未过期 lease 三重 fencing。"""
+    if to == "done":
+        log.error(f"processing -> done 必须使用 finalize_done_owned sid={sid}")
+        return False
     if not can_transition("processing", to):
         log.error(f"非法 worker 状态转换 sid={sid} processing -> {to}")
         return False
