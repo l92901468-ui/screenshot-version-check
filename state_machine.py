@@ -2,11 +2,9 @@ import os
 
 import db, logutil
 
-# 进程名：worker 用 WORKER_ID，api 用 PORT，保证日志落到本进程日志文件里
 _NAME = f"worker-{os.environ.get('WORKER_ID')}" if os.environ.get("WORKER_ID") else f"api-{os.environ.get('PORT', '0')}"
 log = logutil.setup(_NAME)
 
-# 全部状态
 STATES = {
     "uploading": "上传中",
     "pending": "等待中",
@@ -17,15 +15,14 @@ STATES = {
     "arrears": "欠费待充值",
 }
 
-# 转换表：只有这里列出的转换才被允许（这就是统筹整个流程的那张表）
 ALLOWED = {
-    ("uploading", "pending"),     # 对象完整落盘后，才允许进入 worker 队列
-    ("pending", "processing"),   # worker 领取任务
-    ("processing", "done"),      # 识别成功 + 版本核验有结论（通过/未通过都算完成）
-    ("processing", "pending"),   # 识别失败，回队列重试（retry 未达上限）
-    ("processing", "dlq"),       # retry 用尽，转人工
-    ("processing", "arrears"),   # 账户欠费，暂停处理（不消耗 retry）
-    ("arrears", "pending"),      # 充值后恢复，重新入队
+    ("uploading", "pending"),
+    ("pending", "processing"),
+    ("processing", "done"),
+    ("processing", "pending"),
+    ("processing", "dlq"),
+    ("processing", "arrears"),
+    ("arrears", "pending"),
 }
 
 
@@ -34,7 +31,12 @@ def can_transition(curr: str, nxt: str) -> bool:
 
 
 def transition(sid, to: str, **fields) -> bool:
-    """状态变更唯一入口：先校验转换是否合法，再用乐观锁写入（防止并发抢占）"""
+    """普通状态转换入口。
+
+    worker 的 processing ownership 不允许靠这个函数判断；processing 出边必须使用
+    transition_owned/finalize_done_owned。same-state 也不再返回成功，避免“别人已经 claim
+    了 processing，我也把 processing 当作自己 claim 成功”的歧义。
+    """
     row = db.get_task(sid)
     if row is None:
         log.warning(f"状态转换失败：任务不存在 sid={sid}")
@@ -42,7 +44,11 @@ def transition(sid, to: str, **fields) -> bool:
 
     curr = row["status"]
     if curr == to:
-        return True
+        log.warning(f"状态转换拒绝 same-state sid={sid} status={curr}")
+        return False
+    if curr == "processing":
+        log.error(f"processing 状态必须使用 fenced transition sid={sid} -> {to}")
+        return False
     if not can_transition(curr, to):
         log.error(f"非法状态转换已拒绝 sid={sid} {curr}({STATES.get(curr)}) -> {to}({STATES.get(to)})")
         return False
@@ -55,3 +61,50 @@ def transition(sid, to: str, **fields) -> bool:
     else:
         log.warning(f"状态转换未生效（被并发抢占）sid={sid} {curr} -> {to}")
     return ok
+
+
+def transition_owned(sid: int, to: str, owner: str, generation: int, **fields) -> bool:
+    """worker processing 出边：owner + generation + 未过期 lease 三重 fencing。"""
+    if not can_transition("processing", to):
+        log.error(f"非法 worker 状态转换 sid={sid} processing -> {to}")
+        return False
+    fields["status"] = to
+    ok = db.update_processing_owned(sid, owner, generation, fields)
+    if ok:
+        extra = " ".join(f"{k}={v}" for k, v in fields.items() if k != "status")
+        log.info(
+            f"fenced 状态转换 sid={sid} gen={generation} owner={owner} "
+            f"processing -> {to} {extra}".rstrip()
+        )
+    else:
+        log.warning(
+            f"fenced 状态转换被拒绝 sid={sid} gen={generation} owner={owner} -> {to} "
+            f"（lease 过期、已被接管或 generation 不匹配）"
+        )
+    return ok
+
+
+def finalize_done_owned(sid: int, owner: str, generation: int, cost: float,
+                        detected_version: str, required_version: str, result_msg: str):
+    """processing -> done 与本地计费原子提交；stale worker 不得扣费。"""
+    ok, balance = db.finalize_processing_and_charge(
+        sid,
+        owner,
+        generation,
+        cost,
+        {
+            "detected_version": detected_version,
+            "required_version": required_version,
+            "result_msg": result_msg,
+        },
+    )
+    if ok:
+        log.info(
+            f"fenced 完成 sid={sid} gen={generation} owner={owner} processing -> done "
+            f"balance={balance}"
+        )
+    else:
+        log.warning(
+            f"fenced 完成被拒绝 sid={sid} gen={generation} owner={owner}，未扣费"
+        )
+    return ok, balance
