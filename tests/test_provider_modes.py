@@ -48,6 +48,13 @@ class TestProviderModes(ProviderModeBase):
         self.assertFalse(ok)
         self.assertIsNone(version)
         self.assertIn("token missing", msg)
+        self.assertTrue(recognize.is_external_control_block(msg))
+
+    def test_control_block_classifier_does_not_hide_vendor_runtime_failures(self):
+        self.assertTrue(recognize.is_external_control_block("external provider paused: incident"))
+        self.assertTrue(recognize.is_external_control_block("external provider 401: stale credential generation"))
+        self.assertFalse(recognize.is_external_control_block("external provider timeout"))
+        self.assertFalse(recognize.is_external_control_block("external provider 503"))
 
     def test_token_incident_pauses_provider_and_rotates_generation(self):
         before = provider_control.get_state()
@@ -70,6 +77,7 @@ class TestProviderModes(ProviderModeBase):
             ok, _, msg = external_provider.call_vision_model(1, 0)
         self.assertFalse(ok)
         self.assertIn("paused", msg)
+        self.assertTrue(recognize.is_external_control_block(msg))
 
         stages = [e["stage"] for e in provider_control.list_events(incident)]
         for stage in (
@@ -123,7 +131,6 @@ class TestProviderModes(ProviderModeBase):
         self.assertEqual(closed["incident_status"], "closed")
         self.assertIsNone(closed["active_incident_id"])
 
-        # 旧 secret generation 即使 provider 已恢复也不能“复活”。
         old_generation = closed["credential_version"] - 1
         with mock.patch.dict(os.environ, {
             "EXTERNAL_API_TOKEN": "rotated-secret",
@@ -132,6 +139,7 @@ class TestProviderModes(ProviderModeBase):
             ok, _, msg = external_provider.call_vision_model(1, 0)
         self.assertFalse(ok)
         self.assertIn("401", msg)
+        self.assertTrue(recognize.is_external_control_block(msg))
 
         with mock.patch.dict(os.environ, {
             "EXTERNAL_API_TOKEN": "rotated-secret",
