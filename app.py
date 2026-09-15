@@ -4,11 +4,12 @@ import os
 import sqlite3
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 import auth_token
 import billing
+import bounded_http
 import db
 import logutil
 import metrics
@@ -38,10 +39,15 @@ MULTIPART_OVERHEAD_BYTES = max(
 )
 MAX_REQUEST_BODY_SIZE = validate.MAX_SIZE + MULTIPART_OVERHEAD_BYTES
 
-# ThreadingHTTPServer 仍会为连接创建线程，因此这里只做一个简单 admission control：
-# 同一 API 实例最多让固定数量的 /api/submit 真正进入 multipart 解析 / 文件扫描路径；
-# 超出的请求立即 429，让客户端退避重试，而不是把所有上传同时压进进程。
+# 两级并发保护：
+#   1. MAX_ACTIVE_REQUESTS 限制整个 API 实例最多创建多少个 request-handler thread；
+#   2. MAX_INFLIGHT_UPLOADS 再限制其中真正进入 multipart/hash/object-write 的上传请求。
+# 前者防止 ThreadingHTTPServer 在线程层被连接洪峰打爆，后者保护较重的上传路径。
 MAX_INFLIGHT_UPLOADS = max(1, int(os.environ.get("MAX_INFLIGHT_UPLOADS", "16")))
+MAX_ACTIVE_REQUESTS = max(
+    MAX_INFLIGHT_UPLOADS,
+    int(os.environ.get("MAX_ACTIVE_REQUESTS", "64")),
+)
 UPLOAD_SLOTS = threading.BoundedSemaphore(MAX_INFLIGHT_UPLOADS)
 
 CACHE = TTLCache(hard_ttl=10.0, soft_ttl=3.0)
@@ -330,6 +336,7 @@ class Handler(BaseHTTPRequestHandler):
             "cache_enabled": CACHE_ENABLED,
             "cache_keys": CACHE.size() if CACHE_ENABLED else 0,
             "db_pool": db.pool_stats(),
+            "request_concurrency": self.server.concurrency_stats(),
             "max_inflight_uploads": MAX_INFLIGHT_UPLOADS,
             "upload_chunk_size": validate.STREAM_CHUNK_SIZE,
             "max_file_size": validate.MAX_SIZE,
@@ -522,7 +529,11 @@ if __name__ == "__main__":
     db.init_db()
     log.info(
         f"{NAME} 启动 http://{HOST}:{PORT} | "
-        f"max_inflight_uploads={MAX_INFLIGHT_UPLOADS} | chunk={validate.STREAM_CHUNK_SIZE}B | "
-        f"request_body_limit={MAX_REQUEST_BODY_SIZE}B"
+        f"max_active_requests={MAX_ACTIVE_REQUESTS} | max_inflight_uploads={MAX_INFLIGHT_UPLOADS} | "
+        f"chunk={validate.STREAM_CHUNK_SIZE}B | request_body_limit={MAX_REQUEST_BODY_SIZE}B"
     )
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    bounded_http.BoundedThreadingHTTPServer(
+        (HOST, PORT),
+        Handler,
+        max_active_requests=MAX_ACTIVE_REQUESTS,
+    ).serve_forever()
