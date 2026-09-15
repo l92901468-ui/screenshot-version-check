@@ -1,4 +1,5 @@
 import hashlib
+import io
 import os
 import threading
 import time
@@ -6,6 +7,7 @@ import uuid
 
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR") or os.path.join(os.path.dirname(__file__), "uploads")
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".webp"}
+STREAM_CHUNK_SIZE = int(os.environ.get("UPLOAD_CHUNK_SIZE", str(1024 * 1024)))  # 默认 1MiB
 TEMP_FILE_MAX_AGE_SEC = float(os.environ.get("TEMP_FILE_MAX_AGE_SEC", "3600"))
 TEMP_GC_INTERVAL_SEC = float(os.environ.get("TEMP_GC_INTERVAL_SEC", "300"))
 
@@ -44,7 +46,7 @@ def object_hash(key: str) -> str | None:
         return None
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        for chunk in iter(lambda: f.read(STREAM_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -101,13 +103,20 @@ def maybe_cleanup_stale_temp_files() -> int:
     return cleanup_stale_temp_files()
 
 
-def put_object(file_bytes: bytes, filename: str, key: str | None = None) -> dict:
-    # ===== 这里就是“对象存储 (S3 / MinIO)”的接入点 =====
-    # 演示用本地磁盘实现；接 MinIO/S3 时，把下面“临时文件 + 原子 replace”换成
-    # 对应 SDK 的稳定 Key 上传/覆盖语义。上层只依赖 key/path/hash。
+def put_object_stream(file_obj, filename: str, key: str | None = None,
+                      expected_hash: str | None = None, chunk_size: int | None = None) -> dict:
+    """分块把 file-like object 写入对象存储，避免把整张截图复制到 API 内存。
+
+    数据先写到唯一临时文件；只有完整写完、fsync 且 hash 与第一遍扫描一致后，
+    才原子 replace 到稳定 final key。因此读者只会看到完整 final object 或不存在。
+    """
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXT:
         raise ValueError(f"文件格式不支持，仅允许 {sorted(ALLOWED_EXT)}")
+
+    size_per_read = STREAM_CHUNK_SIZE if chunk_size is None else int(chunk_size)
+    if size_per_read <= 0:
+        raise ValueError("chunk_size 必须大于 0")
 
     # 顺手清理 hard kill 遗留的旧临时文件；限频执行，且失败不影响本次上传。
     maybe_cleanup_stale_temp_files()
@@ -117,21 +126,48 @@ def put_object(file_bytes: bytes, filename: str, key: str | None = None) -> dict
     object_key = key or (uuid.uuid4().hex + ext)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     path = _path_for_key(object_key)
-
-    # 先写临时文件，fsync 后再原子替换最终路径。
-    # 这样另一个 API 实例只会看到“完整最终对象”或“还没有最终对象”，不会读到半文件。
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+
+    try:
+        file_obj.seek(0)
+    except (AttributeError, OSError):
+        raise ValueError("对象写入需要可回绕的文件流")
+
+    h = hashlib.sha256()
+    total = 0
     try:
         with open(tmp, "wb") as f:
-            f.write(file_bytes)
+            while True:
+                chunk = file_obj.read(size_per_read)
+                if not chunk:
+                    break
+                total += len(chunk)
+                h.update(chunk)
+                f.write(chunk)
             f.flush()
             os.fsync(f.fileno())
+
+        actual_hash = h.hexdigest()
+        # hash 不一致时绝不能覆盖已有 final object；临时文件交给 finally 删除。
+        if expected_hash is not None and actual_hash != expected_hash:
+            raise RuntimeError("对象写入后的 hash 与请求指纹不一致")
+
         os.replace(tmp, path)
     finally:
+        try:
+            file_obj.seek(0)
+        except (AttributeError, OSError):
+            pass
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except OSError:
             pass
 
-    return {"key": object_key, "path": path, "hash": hash_bytes(file_bytes)}
+    return {"key": object_key, "path": path, "hash": actual_hash, "size": total}
+
+
+def put_object(file_bytes: bytes, filename: str, key: str | None = None) -> dict:
+    """兼容旧的 bytes 调用；主上传路径使用 put_object_stream。"""
+    return put_object_stream(io.BytesIO(file_bytes), filename, key=key,
+                             expected_hash=hash_bytes(file_bytes))
