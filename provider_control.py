@@ -30,9 +30,15 @@ def ensure_schema():
                 credential_version INTEGER NOT NULL DEFAULT 1,
                 token_status TEXT NOT NULL DEFAULT 'active',
                 incident_status TEXT NOT NULL DEFAULT 'none',
+                active_incident_id TEXT,
                 updated_at TEXT NOT NULL
             )"""
         )
+        # 兼容已经跑过早期 demo schema 的数据库。
+        cols = {r["name"] for r in cur.execute("PRAGMA table_info(provider_control)").fetchall()}
+        if "active_incident_id" not in cols:
+            cur.execute("ALTER TABLE provider_control ADD COLUMN active_incident_id TEXT")
+
         cur.execute(
             """CREATE TABLE IF NOT EXISTS provider_incident_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,8 +51,9 @@ def ensure_schema():
         )
         cur.execute(
             """INSERT OR IGNORE INTO provider_control(
-                   provider, enabled, credential_version, token_status, incident_status, updated_at)
-               VALUES(?, 1, 1, 'active', 'none', ?)""",
+                   provider, enabled, credential_version, token_status,
+                   incident_status, active_incident_id, updated_at)
+               VALUES(?, 1, 1, 'active', 'none', NULL, ?)""",
             (PROVIDER, _now()),
         )
         con.commit()
@@ -70,8 +77,17 @@ def _event(cur, incident_id, provider, stage, detail=""):
     )
 
 
-def record_event(incident_id, stage, detail="", provider=PROVIDER):
+def assert_active_incident(incident_id, provider=PROVIDER):
+    state = get_state(provider)
+    if not state or state["active_incident_id"] != incident_id or state["incident_status"] != "contained":
+        raise ValueError("incident is not the active contained provider incident")
+    return state
+
+
+def record_event(incident_id, stage, detail="", provider=PROVIDER, *, require_active=False):
     ensure_schema()
+    if require_active:
+        assert_active_incident(incident_id, provider)
     with db.POOL.connection() as con:
         _event(con.cursor(), incident_id, provider, stage, detail)
         con.commit()
@@ -92,6 +108,10 @@ def begin_token_exposure_incident(reason, suspected_since="unknown", provider=PR
         ).fetchone()
         if before is None:
             raise RuntimeError("provider control row missing")
+        if before["active_incident_id"]:
+            raise RuntimeError(
+                f"provider already has active incident {before['active_incident_id']}"
+            )
 
         # 先记录不含 secret 的最小证据快照；不为了完整调查而延迟 containment。
         _event(
@@ -115,9 +135,10 @@ def begin_token_exposure_incident(reason, suspected_since="unknown", provider=PR
                    credential_version=credential_version+1,
                    token_status='revoked',
                    incident_status='contained',
+                   active_incident_id=?,
                    updated_at=?
                WHERE provider=?""",
-            (_now(), provider),
+            (incident_id, _now(), provider),
         )
         _event(cur, incident_id, provider, "credential_revoked_rotated", "old generation invalidated")
         _event(cur, incident_id, provider, "provider_paused", "new external requests blocked")
@@ -127,12 +148,21 @@ def begin_token_exposure_incident(reason, suspected_since="unknown", provider=PR
     return incident_id, get_state(provider)
 
 
-def close_incident(incident_id, *, human_approved, vendor_confirmed, provider=PROVIDER):
-    """只有人工批准 + 供应商确认后才恢复 external provider。"""
+def close_incident(
+    incident_id,
+    *,
+    human_approved,
+    vendor_confirmed,
+    credential_deployed,
+    provider=PROVIDER,
+):
+    """人工批准 + vendor 确认 + 新 credential 已部署后才恢复 external provider。"""
     if not human_approved:
         raise ValueError("human approval required before closing incident")
     if not vendor_confirmed:
         raise ValueError("vendor confirmation required before closing incident")
+    if not credential_deployed:
+        raise ValueError("rotated credential must be deployed before provider resume")
 
     ensure_schema()
     with db.POOL.connection() as con:
@@ -140,17 +170,23 @@ def close_incident(incident_id, *, human_approved, vendor_confirmed, provider=PR
         row = cur.execute(
             "SELECT * FROM provider_control WHERE provider=?", (provider,)
         ).fetchone()
-        if row is None or row["incident_status"] == "none":
-            raise RuntimeError("no active provider incident")
+        if (
+            row is None
+            or row["incident_status"] != "contained"
+            or row["active_incident_id"] != incident_id
+        ):
+            raise RuntimeError("incident is not the active contained provider incident")
 
         _event(cur, incident_id, provider, "human_approval", "targeted remediation approved")
         _event(cur, incident_id, provider, "targeted_remediation", "affected requests/data handled according to confirmed scope")
         _event(cur, incident_id, provider, "vendor_confirmation", "provider acknowledgement/confirmation received")
+        _event(cur, incident_id, provider, "credential_deployed", "rotated credential distributed through controlled channel")
         cur.execute(
             """UPDATE provider_control
                SET enabled=1,
                    token_status='active',
                    incident_status='closed',
+                   active_incident_id=NULL,
                    updated_at=?
                WHERE provider=?""",
             (_now(), provider),
