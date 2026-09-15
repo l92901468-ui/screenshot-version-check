@@ -2,7 +2,6 @@ import os
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 
@@ -59,6 +58,10 @@ class TestProviderModes(ProviderModeBase):
         self.assertEqual(contained["enabled"], 0)
         self.assertEqual(contained["token_status"], "revoked")
         self.assertEqual(contained["credential_version"], before["credential_version"] + 1)
+        self.assertEqual(contained["active_incident_id"], incident)
+
+        with self.assertRaises(RuntimeError):
+            provider_control.begin_token_exposure_incident("second overlapping leak")
 
         with mock.patch.dict(os.environ, {
             "EXTERNAL_API_TOKEN": "do-not-log-me",
@@ -78,29 +81,47 @@ class TestProviderModes(ProviderModeBase):
         ):
             self.assertIn(stage, stages)
 
-    def test_close_requires_human_and_vendor_confirmation(self):
-        incident, state = provider_control.begin_token_exposure_incident("suspected leak")
+    def test_close_requires_human_vendor_and_rotated_credential(self):
+        incident, _ = provider_control.begin_token_exposure_incident("suspected leak")
         with self.assertRaises(ValueError):
             provider_control.close_incident(
                 incident,
                 human_approved=False,
                 vendor_confirmed=True,
+                credential_deployed=True,
             )
         with self.assertRaises(ValueError):
             provider_control.close_incident(
                 incident,
                 human_approved=True,
                 vendor_confirmed=False,
+                credential_deployed=True,
+            )
+        with self.assertRaises(ValueError):
+            provider_control.close_incident(
+                incident,
+                human_approved=True,
+                vendor_confirmed=True,
+                credential_deployed=False,
+            )
+        with self.assertRaises(RuntimeError):
+            provider_control.close_incident(
+                "INC-wrong-id",
+                human_approved=True,
+                vendor_confirmed=True,
+                credential_deployed=True,
             )
 
         closed = provider_control.close_incident(
             incident,
             human_approved=True,
             vendor_confirmed=True,
+            credential_deployed=True,
         )
         self.assertEqual(closed["enabled"], 1)
         self.assertEqual(closed["token_status"], "active")
         self.assertEqual(closed["incident_status"], "closed")
+        self.assertIsNone(closed["active_incident_id"])
 
         # 旧 secret generation 即使 provider 已恢复也不能“复活”。
         old_generation = closed["credential_version"] - 1
