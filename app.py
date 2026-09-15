@@ -13,6 +13,7 @@ import db
 import logutil
 import metrics
 import object_store
+import request_limits
 import state_machine as sm
 import validate
 from cache import TTLCache
@@ -29,6 +30,13 @@ log = logutil.setup(NAME)
 STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
 CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "1") == "1"
 TERMINAL_STATES = {"done", "dlq", "rejected"}
+
+# multipart body 会比文件本体多 boundary / headers / 少量表单字段。
+# 文件上限仍是 validate.MAX_SIZE=10MiB；请求体只额外留一小段协议开销，而不是无限接收后再校验。
+MULTIPART_OVERHEAD_BYTES = max(
+    0, int(os.environ.get("MULTIPART_OVERHEAD_BYTES", str(256 * 1024)))
+)
+MAX_REQUEST_BODY_SIZE = validate.MAX_SIZE + MULTIPART_OVERHEAD_BYTES
 
 # ThreadingHTTPServer 仍会为连接创建线程，因此这里只做一个简单 admission control：
 # 同一 API 实例最多让固定数量的 /api/submit 真正进入 multipart 解析 / 文件扫描路径；
@@ -234,12 +242,55 @@ class Handler(BaseHTTPRequestHandler):
             headers,
         )
 
+    def _check_submit_body_length(self):
+        """在 multipart parser 读取任何 body 前做 request-level hard limit。"""
+        try:
+            return request_limits.checked_content_length(
+                self.headers, MAX_REQUEST_BODY_SIZE
+            )
+        except request_limits.RequestBodyTooLarge as ex:
+            self.close_connection = True
+            log.warning(f"上传请求体过大，parse 前拒绝: {ex}")
+            self._send(
+                413,
+                {
+                    "ok": False,
+                    "action": "reduce_file",
+                    "msg": f"请求体过大；截图文件最大 {validate.MAX_SIZE // 1024 // 1024}MB",
+                },
+                {"Connection": "close"},
+            )
+            return None
+        except request_limits.LengthRequired as ex:
+            self.close_connection = True
+            log.warning(f"上传请求缺少可验证长度: {ex}")
+            self._send(
+                411,
+                {"ok": False, "action": "retry_later", "msg": str(ex)},
+                {"Connection": "close"},
+            )
+            return None
+        except request_limits.InvalidContentLength as ex:
+            self.close_connection = True
+            log.warning(f"上传 Content-Length 非法: {ex}")
+            self._send(
+                400,
+                {"ok": False, "action": "relogin", "msg": str(ex)},
+                {"Connection": "close"},
+            )
+            return None
+
     def do_POST(self):
         self._start()
         path = urlparse(self.path).path
         if path == "/api/login":
             return self.handle_login()
         if path == "/api/submit":
+            # 先看 headers：500MB 这类请求在 cgi.FieldStorage 读取 body 之前就 413。
+            content_length = self._check_submit_body_length()
+            if content_length is None:
+                return
+
             # 不排队堆积无限上传：没有 slot 就快速失败，客户端按 Retry-After 重试。
             if not UPLOAD_SLOTS.acquire(blocking=False):
                 self.close_connection = True
@@ -252,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"Retry-After": "1", "Connection": "close"},
                 )
             try:
-                return self.handle_submit()
+                return self.handle_submit(content_length)
             finally:
                 UPLOAD_SLOTS.release()
         return self._send(*err("pause", 404, "接口不存在"))
@@ -281,6 +332,8 @@ class Handler(BaseHTTPRequestHandler):
             "db_pool": db.pool_stats(),
             "max_inflight_uploads": MAX_INFLIGHT_UPLOADS,
             "upload_chunk_size": validate.STREAM_CHUNK_SIZE,
+            "max_file_size": validate.MAX_SIZE,
+            "max_request_body_size": MAX_REQUEST_BODY_SIZE,
         }
         return self._send(200, {"ok": True, "action": "success", "health": m, "instance": inst})
 
@@ -300,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
         log.info(f"账号登录成功 uid={uid} username={username} -> 签发 token")
         return self._send(200, {"ok": True, "token": auth_token.issue_token(uid)})
 
-    def handle_submit(self):
+    def handle_submit(self, content_length):
         uid, e = self._auth()
         if e:
             return self._send(*e)
@@ -320,11 +373,42 @@ class Handler(BaseHTTPRequestHandler):
         if not ctype.startswith("multipart/form-data"):
             return self._send(*err("relogin", 400, "需以 multipart/form-data 上传"))
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": ctype},
-        )
+        # Content-Length 是 parse 前 fast reject；LimitedReader 是 defense-in-depth：
+        # malformed multipart 也不能让 parser 从 socket 读取超过应用硬上限。
+        bounded_body = request_limits.LimitedReader(self.rfile, MAX_REQUEST_BODY_SIZE)
+        try:
+            form = cgi.FieldStorage(
+                fp=bounded_body,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": ctype,
+                    "CONTENT_LENGTH": str(content_length),
+                },
+                limit=content_length,
+                max_num_fields=8,
+            )
+        except request_limits.RequestBodyTooLarge as ex:
+            self.close_connection = True
+            log.warning(f"multipart parser 触发实际读取硬上限: {ex}")
+            return self._send(
+                413,
+                {
+                    "ok": False,
+                    "action": "reduce_file",
+                    "msg": f"请求体过大；截图文件最大 {validate.MAX_SIZE // 1024 // 1024}MB",
+                },
+                {"Connection": "close"},
+            )
+        except (ValueError, TypeError) as ex:
+            self.close_connection = True
+            log.warning(f"multipart 解析失败: {ex}")
+            return self._send(
+                400,
+                {"ok": False, "action": "relogin", "msg": "multipart 请求体非法"},
+                {"Connection": "close"},
+            )
+
         if "file" not in form:
             return self._send(*err("relogin", 400, "缺少文件字段"))
 
@@ -438,6 +522,7 @@ if __name__ == "__main__":
     db.init_db()
     log.info(
         f"{NAME} 启动 http://{HOST}:{PORT} | "
-        f"max_inflight_uploads={MAX_INFLIGHT_UPLOADS} | chunk={validate.STREAM_CHUNK_SIZE}B"
+        f"max_inflight_uploads={MAX_INFLIGHT_UPLOADS} | chunk={validate.STREAM_CHUNK_SIZE}B | "
+        f"request_body_limit={MAX_REQUEST_BODY_SIZE}B"
     )
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
