@@ -9,7 +9,6 @@ from cache import TTLCache
 
 class Base(unittest.TestCase):
     def setUp(self):
-        # 每个用例用独立临时库，互不干扰（连接池也要跟着重建，否则连的还是上一个库）
         db.reset_pool(os.path.join(tempfile.mkdtemp(), "test.db"))
         db.init_db()
 
@@ -18,43 +17,64 @@ class Base(unittest.TestCase):
                               {"key": "k.png", "path": "/tmp/k.png", "hash": "h"},
                               status="pending")
 
+    def claim(self, owner="test-worker", lease=10.0):
+        row = db.claim_next_task(owner, lease)
+        self.assertIsNotNone(row)
+        return row
+
 
 class TestVersion(Base):
     def test_meets_version(self):
-        self.assertTrue(recognize.meets_version("10.0.19045", "10.0.19045"))   # 相等算通过
-        self.assertTrue(recognize.meets_version("10.0.19046", "10.0.19045"))   # 更高
-        self.assertFalse(recognize.meets_version("10.0.19041", "10.0.19045"))  # 更低
-        self.assertFalse(recognize.meets_version("9.9.99999", "10.0.19045"))   # 主版本更低
+        self.assertTrue(recognize.meets_version("10.0.19045", "10.0.19045"))
+        self.assertTrue(recognize.meets_version("10.0.19046", "10.0.19045"))
+        self.assertFalse(recognize.meets_version("10.0.19041", "10.0.19045"))
+        self.assertFalse(recognize.meets_version("9.9.99999", "10.0.19045"))
 
     def test_parse_version(self):
         self.assertEqual(recognize.parse_version("10.0.19045"), (10, 0, 19045))
 
 
 class TestStateMachine(Base):
-    def test_legal_transition(self):
+    def test_legal_processing_finalize_is_fenced_and_billed(self):
         sid = self.new_task()
-        self.assertTrue(sm.transition(sid, "processing"))
-        self.assertEqual(db.get_task(sid)["status"], "processing")
-        self.assertTrue(sm.transition(sid, "done", result_msg="ok"))
+        row = self.claim()
+        self.assertEqual(row["id"], sid)
+        self.assertEqual(row["status"], "processing")
+        ok, balance = sm.finalize_done_owned(
+            sid, "test-worker", row["processing_generation"], 1.0,
+            "10.0.19045", "10.0.19045", "ok",
+        )
+        self.assertTrue(ok)
+        self.assertAlmostEqual(balance, 99.0)
         self.assertEqual(db.get_task(sid)["status"], "done")
+
+    def test_plain_transition_cannot_claim_processing(self):
+        sid = self.new_task()
+        self.assertFalse(sm.transition(sid, "processing"))
+        self.assertEqual(db.get_task(sid)["status"], "pending")
 
     def test_illegal_transition_rejected(self):
         sid = self.new_task()
-        self.assertFalse(sm.can_transition("pending", "done"))   # 不允许跳步
+        self.assertFalse(sm.can_transition("pending", "done"))
         self.assertFalse(sm.transition(sid, "done"))
         self.assertEqual(db.get_task(sid)["status"], "pending")
 
     def test_terminal_cannot_reprocess(self):
         sid = self.new_task()
-        sm.transition(sid, "processing")
-        sm.transition(sid, "dlq", retry_count=3, result_msg="失败")
-        self.assertFalse(sm.transition(sid, "processing"))       # DLQ 不能再被领取
+        row = self.claim()
+        self.assertTrue(sm.transition_owned(
+            sid, "dlq", "test-worker", row["processing_generation"], retry_count=3, result_msg="失败"
+        ))
+        self.assertIsNone(db.claim_next_task("other-worker", 10.0))
+        self.assertFalse(sm.transition(sid, "processing"))
 
     def test_arrears_recover(self):
         sid = self.new_task()
-        sm.transition(sid, "processing")
-        self.assertTrue(sm.transition(sid, "arrears", result_msg="欠费"))
-        self.assertTrue(sm.transition(sid, "pending", result_msg="充值"))  # 充值后回队列
+        row = self.claim()
+        self.assertTrue(sm.transition_owned(
+            sid, "arrears", "test-worker", row["processing_generation"], result_msg="欠费"
+        ))
+        self.assertTrue(sm.transition(sid, "pending", result_msg="充值"))
 
 
 class TestCache(unittest.TestCase):
@@ -64,7 +84,7 @@ class TestCache(unittest.TestCase):
         self.assertEqual(c.size(), 1)
         time.sleep(0.6)
         val, need = c.get("a")
-        self.assertIsNone(val)          # 已过期，被自动删除
+        self.assertIsNone(val)
         self.assertEqual(c.size(), 0)
 
     def test_soft_ttl_needs_verify(self):
@@ -72,8 +92,8 @@ class TestCache(unittest.TestCase):
         c.set("a", {"v": 1})
         time.sleep(0.4)
         val, need = c.get("a")
-        self.assertIsNotNone(val)       # 未硬过期，仍命中
-        self.assertTrue(need)           # 但需回源与 DB 核对（冲突以 DB 为准）
+        self.assertIsNotNone(val)
+        self.assertTrue(need)
 
 
 class TestBilling(Base):
@@ -91,8 +111,8 @@ class TestBilling(Base):
 class TestDb(Base):
     def test_optimistic_lock(self):
         sid = self.new_task()
-        self.assertTrue(db.update_task(sid, "pending", {"status": "processing"}))
-        self.assertFalse(db.update_task(sid, "pending", {"status": "processing"}))  # 状态已变，写入应失败
+        self.assertTrue(db.update_task(sid, "pending", {"result_msg": "first"}))
+        self.assertFalse(db.update_task(sid, "done", {"result_msg": "second"}))
 
     def test_find_pending(self):
         sid = self.new_task()
@@ -121,15 +141,13 @@ class TestRetryJitter(unittest.TestCase):
 
 
 class TestConnectionPool(Base):
-    """连接池：复用、上限、超时、切换。"""
-
     def test_connection_reused(self):
-        before = db.pool_stats()["borrows"]      # setUp 里的 init_db 已经借过一次
+        before = db.pool_stats()["borrows"]
         db.get_task(1)
         db.get_task(1)
         st = db.pool_stats()
         self.assertEqual(st["borrows"], before + 2)
-        self.assertLessEqual(st["created"], 1, "两次查询应该复用同一个连接，而不是各建一条")
+        self.assertLessEqual(st["created"], 1)
 
     def test_pool_limit_and_timeout(self):
         path = os.path.join(tempfile.mkdtemp(), "pool.db")
@@ -138,7 +156,6 @@ class TestConnectionPool(Base):
             with self.assertRaises(RuntimeError):
                 with pool.connection():
                     pass
-        # 归还之后可以再借
         with pool.connection():
             pass
         self.assertGreaterEqual(pool.stats()["waits"], 1)
@@ -152,17 +169,24 @@ class TestConnectionPool(Base):
         self.assertIsNotNone(db.get_task(sid))
         db.reset_pool(b)
         db.init_db()
-        self.assertIsNone(db.get_task(sid), "切换库后不应再看到上一个库的数据")
+        self.assertIsNone(db.get_task(sid))
 
 
 class TestStateless(Base):
-    """无状态：关掉本地缓存后行为一致；中间态不进缓存。"""
-
     def setUp(self):
         super().setUp()
         import app
         self.app = app
         app.CACHE.clear()
+
+    def _finish_task(self, sid, owner="cache-worker"):
+        row = db.claim_next_task(owner, 10.0)
+        self.assertEqual(row["id"], sid)
+        ok, _ = sm.finalize_done_owned(
+            sid, owner, row["processing_generation"], 1.0,
+            "10.0.19045", "10.0.19045", "done",
+        )
+        self.assertTrue(ok)
 
     def test_cache_disabled_hits_db(self):
         self.app.CACHE_ENABLED = False
@@ -170,31 +194,28 @@ class TestStateless(Base):
         task, src = self.app.read_task(sid)
         self.assertEqual(src, "db(无缓存模式)")
         self.assertEqual(task["status"], "pending")
-        self.assertEqual(self.app.CACHE.size(), 0, "无缓存模式不该往本地缓存写东西")
+        self.assertEqual(self.app.CACHE.size(), 0)
 
     def test_only_terminal_state_cached(self):
         self.app.CACHE_ENABLED = True
         sid = self.new_task()
-        _, src = self.app.read_task(sid)
-        self.assertEqual(self.app.CACHE.size(), 0, "pending 是中间态，不该进缓存")
-        sm.transition(sid, "processing")
-        sm.transition(sid, "done", detected_version="10.0.19045")
-        _, src2 = self.app.read_task(sid)
-        self.assertEqual(self.app.CACHE.size(), 1, "done 是终态，应该进缓存")
+        self.app.read_task(sid)
+        self.assertEqual(self.app.CACHE.size(), 0)
+        self._finish_task(sid)
+        self.app.read_task(sid)
+        self.assertEqual(self.app.CACHE.size(), 1)
 
     def test_cache_conflict_falls_back_to_db(self):
         self.app.CACHE_ENABLED = True
         sid = self.new_task()
-        sm.transition(sid, "processing")
-        sm.transition(sid, "done", detected_version="10.0.19045")
+        self._finish_task(sid)
         task, _ = self.app.read_task(sid)
-        # 手动塞一份"落后于 DB"的缓存，并把它写成 5 秒前（越过 soft_ttl 触发回源核对）
-        stale = dict(task, status="pending", updated_at="2000-01-01 00:00:00")
+        stale = dict(task, result_msg="stale", updated_at="2000-01-01 00:00:00")
         with self.app.CACHE._lock:
             self.app.CACHE._data[sid] = (stale, time.time() - 5)
-        db.update_task(sid, "done", {"status": "dlq"})
+        self.assertTrue(db.update_task(sid, "done", {"result_msg": "fresh"}))
         fresh, src = self.app.read_task(sid)
-        self.assertEqual(fresh["status"], "dlq", "缓存与 DB 冲突时必须以 DB 为准")
+        self.assertEqual(fresh["result_msg"], "fresh")
 
 
 if __name__ == "__main__":
