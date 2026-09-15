@@ -8,6 +8,7 @@ log = logutil.setup(_NAME)
 
 # 全部状态
 STATES = {
+    "uploading": "上传中",
     "pending": "等待中",
     "processing": "处理中",
     "done": "完成",
@@ -18,6 +19,7 @@ STATES = {
 
 # 转换表：只有这里列出的转换才被允许（这就是统筹整个流程的那张表）
 ALLOWED = {
+    ("uploading", "pending"),     # 对象完整落盘后，才允许进入 worker 队列
     ("pending", "processing"),   # worker 领取任务
     ("processing", "done"),      # 识别成功 + 版本核验有结论（通过/未通过都算完成）
     ("processing", "pending"),   # 识别失败，回队列重试（retry 未达上限）

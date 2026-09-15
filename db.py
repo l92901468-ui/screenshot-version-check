@@ -8,13 +8,17 @@ from contextlib import contextmanager
 
 DB_PATH = os.environ.get("DB_PATH") or os.path.join(os.path.dirname(__file__), "app.db")
 MAX_RETRY = 3  # retry 次数上限：达到即进 DLQ 待人工审核
+UPLOAD_LEASE_SEC = float(os.environ.get("UPLOAD_LEASE_SEC", "30"))
 
 # 连接池大小：API 每实例 4 线程 + worker 每实例 4 线程，默认 8 够用；
 # SQLite 是单写者，池子开太大只会增加锁竞争，不会提高吞吐。
 POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "8"))
 POOL_TIMEOUT = float(os.environ.get("DB_POOL_TIMEOUT", "10"))
 
-UPDATABLE = {"status", "retry_count", "result_msg", "detected_version", "required_version", "next_attempt_at"}
+UPDATABLE = {
+    "status", "retry_count", "result_msg", "detected_version", "required_version", "next_attempt_at",
+    "object_key", "object_path", "file_hash", "upload_lease_until",
+}
 
 
 class ConnectionPool:
@@ -143,6 +147,7 @@ def init_db():
                 status TEXT NOT NULL,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at REAL NOT NULL DEFAULT 0,
+                upload_lease_until REAL NOT NULL DEFAULT 0,
                 object_key TEXT, object_path TEXT, file_hash TEXT,
                 idempotency_key TEXT, result_msg TEXT,
                 detected_version TEXT,
@@ -152,6 +157,8 @@ def init_db():
         cols = {row["name"] for row in cur.execute("PRAGMA table_info(submissions)").fetchall()}
         if "next_attempt_at" not in cols:
             cur.execute("ALTER TABLE submissions ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0")
+        if "upload_lease_until" not in cols:
+            cur.execute("ALTER TABLE submissions ADD COLUMN upload_lease_until REAL NOT NULL DEFAULT 0")
         cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
                 user_id INTEGER PRIMARY KEY,
                 balance REAL NOT NULL DEFAULT 100.0)""")
@@ -174,12 +181,72 @@ def verify_user(username: str, password: str):
 
 def find_by_idempotency(user_id, key):
     with POOL.connection() as con:
-        row = con.execute("SELECT id, status, object_key, result_msg FROM submissions WHERE user_id=? AND idempotency_key=?",
-                          (user_id, key)).fetchone()
+        row = con.execute(
+            """SELECT id, status, object_key, object_path, file_hash, upload_lease_until,
+                      result_msg, updated_at
+               FROM submissions WHERE user_id=? AND idempotency_key=?""",
+            (user_id, key),
+        ).fetchone()
     return dict(row) if row else None
 
 
+def reserve_upload(user_id, idem_key, file_hash):
+    """先在 DB 中持久化幂等记录，再允许对象存储副作用发生。
+
+    返回 (row, created):
+      - created=True：当前请求赢得首次上传权，row.status=uploading。
+      - created=False：同一个 (user_id, idempotency_key) 已存在，调用方应重放/恢复，
+        并先核对 row.file_hash 是否与本次请求一致。
+
+    upload_lease_until 防止两个 API 实例同时恢复同一个中断上传。
+    """
+    now_text = _now()
+    lease_until = time.time() + UPLOAD_LEASE_SEC
+    with POOL.connection() as con:
+        cur = con.cursor()
+        try:
+            cur.execute(
+                """INSERT INTO submissions(
+                       user_id, status, retry_count, next_attempt_at, upload_lease_until,
+                       file_hash, idempotency_key, created_at, updated_at)
+                   VALUES(?, 'uploading', 0, 0, ?, ?, ?, ?, ?)""",
+                (user_id, lease_until, file_hash, idem_key, now_text, now_text),
+            )
+            sid = cur.lastrowid
+            con.commit()
+            row = cur.execute("SELECT * FROM submissions WHERE id=?", (sid,)).fetchone()
+            return dict(row), True
+        except sqlite3.IntegrityError:
+            con.rollback()
+            row = cur.execute(
+                "SELECT * FROM submissions WHERE user_id=? AND idempotency_key=?",
+                (user_id, idem_key),
+            ).fetchone()
+            if row is None:
+                raise
+            return dict(row), False
+
+
+def claim_stale_upload(sid, file_hash):
+    """只有 upload lease 已过期的 uploading 任务才能被一个重试请求重新领取。"""
+    now_epoch = time.time()
+    new_lease = now_epoch + UPLOAD_LEASE_SEC
+    now_text = _now()
+    with POOL.connection() as con:
+        cur = con.cursor()
+        cur.execute(
+            """UPDATE submissions
+               SET upload_lease_until=?, updated_at=?
+               WHERE id=? AND status='uploading' AND file_hash=? AND upload_lease_until<=?""",
+            (new_lease, now_text, sid, file_hash, now_epoch),
+        )
+        ok = cur.rowcount == 1
+        con.commit()
+    return ok
+
+
 def insert_task(user_id, idem_key, meta, status="pending") -> int:
+    """测试/内部辅助入口。正常 /api/submit 使用 reserve_upload -> uploading -> pending。"""
     now = _now()
     with POOL.connection() as con:
         cur = con.cursor()
@@ -192,13 +259,14 @@ def insert_task(user_id, idem_key, meta, status="pending") -> int:
     return sid
 
 
-def insert_rejected(user_id, idem_key, msg) -> int:
+def insert_rejected(user_id, idem_key, msg, file_hash=None) -> int:
     now = _now()
     with POOL.connection() as con:
         cur = con.cursor()
-        cur.execute("""INSERT INTO submissions(user_id, status, retry_count, idempotency_key, result_msg,
-                       created_at, updated_at) VALUES(?, 'rejected', 0, ?, ?, ?, ?)""",
-                    (user_id, idem_key, msg, now, now))
+        cur.execute("""INSERT INTO submissions(user_id, status, retry_count, file_hash,
+                       idempotency_key, result_msg, created_at, updated_at)
+                       VALUES(?, 'rejected', 0, ?, ?, ?, ?, ?)""",
+                    (user_id, file_hash, idem_key, msg, now, now))
         sid = cur.lastrowid
         con.commit()
     return sid
