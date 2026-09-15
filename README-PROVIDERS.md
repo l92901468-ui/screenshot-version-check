@@ -49,12 +49,15 @@ fenced finalize + simulated usage charge
 VISION_BACKEND=external
 EXTERNAL_API_TOKEN=demo-secret
 EXTERNAL_API_CREDENTIAL_VERSION=1
+CONTROL_BLOCK_RETRY_SEC=30
 ```
 
 `EXTERNAL_API_TOKEN` 只从环境变量读取，代码不会把 token 值写入 DB、日志或 incident evidence。
 真实生产应替换成 secret manager / workload identity，并通过 HTTPS/mTLS 等受控通道调用供应商。
 
 外部模式保留 `billing.py` 的原因是用它模拟“第三方 API 调用额度/成本”，而不是模拟员工真的拿自己的钱付截图识别费。并发扣费的正确性仍要由数据库里的条件更新保证，不能只靠 worker 先读余额。
+
+外部 provider 被安全控制面暂停、token 未部署、或 worker 仍持有旧 credential generation 时，这些并不是“截图识别失败”。worker 会把任务重新放回 `pending`，等待 `CONTROL_BLOCK_RETRY_SEC` 后再检查，并且**不增加业务 `retry_count`**。这样一次 token incident 不会把正常任务的三次识别重试全部烧完后送进 DLQ。是否切到 internal backend 由运维/策略显式决定，不做静默自动 fallback。
 
 ## External token exposure workflow
 
@@ -109,6 +112,10 @@ python3 token_incident.py show --incident INC-xxxx
 ### 为什么 provider pause 要放进共享 DB？
 
 如果只在某个 worker 内存里设 `paused=True`，其他 worker 仍可能继续用泄露 token 调供应商，这又把系统变成有本地权威状态。共享 provider control 让所有 worker 看到同一 containment 状态。
+
+### 为什么 pause 期间不消耗普通 retry？
+
+`retry_count` 表示的是“这个截图的识别尝试失败了几次”。而 token 被撤销、供应商被主动暂停属于控制面状态，不说明截图本身难以识别。把两种失败混在一起，会导致 incident containment 期间大量任务无意义进入 DLQ。因此控制面阻断采用独立等待窗口，业务 retry 保持不变。
 
 ### 为什么 rotate 以后还要显式确认 credential 已部署？
 
