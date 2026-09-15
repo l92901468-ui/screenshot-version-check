@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,9 +17,11 @@ class TestUploadIdempotency(unittest.TestCase):
         db.init_db()
         self._old_upload_dir = object_store.UPLOAD_DIR
         object_store.UPLOAD_DIR = tempfile.mkdtemp()
+        object_store._last_gc_at = 0.0
 
     def tearDown(self):
         object_store.UPLOAD_DIR = self._old_upload_dir
+        object_store._last_gc_at = 0.0
 
     def test_reservation_is_persisted_before_object_side_effect(self):
         body = b"\x89PNGdemo"
@@ -86,6 +89,27 @@ class TestUploadIdempotency(unittest.TestCase):
         self.assertEqual(replay["id"], sid)
         self.assertEqual(db.get_task(sid)["status"], "pending")
         self.assertEqual(os.listdir(object_store.UPLOAD_DIR), [key])
+
+    def test_cleanup_stale_temp_files_only_removes_old_tmp(self):
+        now = time.time()
+        old_tmp = os.path.join(object_store.UPLOAD_DIR, "submission-1.111.222.tmp")
+        fresh_tmp = os.path.join(object_store.UPLOAD_DIR, "submission-2.333.444.tmp")
+        final_obj = os.path.join(object_store.UPLOAD_DIR, "submission-3")
+
+        for path in (old_tmp, fresh_tmp, final_obj):
+            with open(path, "wb") as f:
+                f.write(b"x")
+
+        os.utime(old_tmp, (now - 7200, now - 7200))
+        os.utime(fresh_tmp, (now - 60, now - 60))
+        os.utime(final_obj, (now - 7200, now - 7200))
+
+        removed = object_store.cleanup_stale_temp_files(max_age_sec=3600, now=now)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(os.path.exists(old_tmp), "过期 .tmp 应被清理")
+        self.assertTrue(os.path.exists(fresh_tmp), "新鲜 .tmp 不能误删")
+        self.assertTrue(os.path.exists(final_obj), "final object 绝不能被 GC 删除")
 
 
 if __name__ == "__main__":
