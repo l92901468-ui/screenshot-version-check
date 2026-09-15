@@ -15,6 +15,7 @@ THREADS = int(os.environ.get("WORKER_THREADS", "4"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "0.5"))
 RETRY_BASE_SEC = float(os.environ.get("RETRY_BASE_SEC", "1.0"))
 RETRY_MAX_SEC = float(os.environ.get("RETRY_MAX_SEC", "30.0"))
+CONTROL_BLOCK_RETRY_SEC = max(1.0, float(os.environ.get("CONTROL_BLOCK_RETRY_SEC", "30.0")))
 PROCESSING_LEASE_SEC = max(0.5, float(os.environ.get("PROCESSING_LEASE_SEC", str(db.PROCESSING_LEASE_SEC))))
 PROCESSING_HEARTBEAT_SEC = max(
     0.1,
@@ -179,6 +180,27 @@ def handle_one(tid: str):
             _log_uncertain_commit(tid, sid, generation, "after_model")
 
         if not ok:
+            # token incident pause / secret missing / stale credential 不是“截图识别失败”。
+            # 保持 retry_count 不变，把任务放回 pending，避免安全 containment 把业务 retry 烧光进 DLQ。
+            if external and recognize.is_external_control_block(msg):
+                next_attempt_at = time.time() + CONTROL_BLOCK_RETRY_SEC
+                if sm.transition_owned(
+                    sid,
+                    "pending",
+                    tid,
+                    generation,
+                    retry_count=rc,
+                    next_attempt_at=next_attempt_at,
+                    result_msg=msg,
+                ):
+                    log.warning(
+                        f"[{tid}] sid={sid} gen={generation} external control block -> "
+                        f"{CONTROL_BLOCK_RETRY_SEC:.1f}s 后再检查，业务 retry 仍为 {rc}（{msg}）"
+                    )
+                else:
+                    _stale_result(tid, sid, generation, "external_control_block")
+                return True
+
             new_rc = rc + 1
             if new_rc >= db.MAX_RETRY:
                 if sm.transition_owned(
@@ -300,6 +322,7 @@ def main():
         f"{NAME} 启动 | 并发线程={THREADS} | retry上限={db.MAX_RETRY} | "
         f"backend={recognize.backend_name()} | "
         f"退避基数={RETRY_BASE_SEC}s 上限={RETRY_MAX_SEC}s | "
+        f"control-block重试={CONTROL_BLOCK_RETRY_SEC}s | "
         f"processing lease={PROCESSING_LEASE_SEC}s heartbeat={PROCESSING_HEARTBEAT_SEC}s | "
         f"要求版本={recognize.REQUIRED_VERSION}"
     )
