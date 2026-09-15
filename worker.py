@@ -15,6 +15,7 @@ THREADS = int(os.environ.get("WORKER_THREADS", "4"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "0.5"))
 RETRY_BASE_SEC = float(os.environ.get("RETRY_BASE_SEC", "1.0"))
 RETRY_MAX_SEC = float(os.environ.get("RETRY_MAX_SEC", "30.0"))
+CONTROL_BLOCK_RETRY_SEC = max(1.0, float(os.environ.get("CONTROL_BLOCK_RETRY_SEC", "30.0")))
 PROCESSING_LEASE_SEC = max(0.5, float(os.environ.get("PROCESSING_LEASE_SEC", str(db.PROCESSING_LEASE_SEC))))
 PROCESSING_HEARTBEAT_SEC = max(
     0.1,
@@ -36,12 +37,8 @@ def retry_delay(retry_count: int) -> float:
 class ProcessingLeaseHeartbeat:
     """独立 heartbeat，防止长时间模型调用期间 processing lease 自然过期。
 
-    `renew_processing_lease()` 明确返回 False 时，DB 已经给出了权威答案：当前
-    owner/generation/lease 已不再有效，因此标记为 `lost` 并停止续租。
-
-    如果只是 DB 异常/超时，则本地无法判断 lease 是否仍然有效。这种情况只标记为
-    `uncertain`，继续重试 heartbeat；后续副作用仍交给数据库里的 owner + generation +
-    live lease fencing 做最终裁决。这样不会因为一次短暂 DB 抖动就无条件丢弃模型结果。
+    DB 明确返回 False 才代表 ownership 确定丢失；DB 异常只标记 uncertain，继续重试。
+    最终副作用仍由数据库里的 owner + generation + live lease fencing 做权威裁决。
     """
 
     def __init__(self, sid: int, owner: str, generation: int):
@@ -61,7 +58,6 @@ class ProcessingLeaseHeartbeat:
         self._thread.start()
 
     def renew_once(self):
-        """执行一次 heartbeat，返回 renewed / uncertain / lost。"""
         try:
             renewed = db.renew_processing_lease(
                 self.sid,
@@ -70,7 +66,6 @@ class ProcessingLeaseHeartbeat:
                 PROCESSING_LEASE_SEC,
             )
         except Exception:
-            # DB 不可用并不等价于 ownership 已丢失；只能说明当前无法证明。
             self.uncertain.set()
             log.exception(
                 f"lease heartbeat 异常 sid={self.sid} gen={self.generation} owner={self.owner}；"
@@ -79,7 +74,6 @@ class ProcessingLeaseHeartbeat:
             return "uncertain"
 
         if not renewed:
-            # DB 已可达且 fenced renewal 明确失败：当前 lease 已失效/被接管。
             self.lost.set()
             self.uncertain.clear()
             log.warning(
@@ -131,47 +125,51 @@ def handle_one(tid: str):
     generation = int(row["processing_generation"])
     uid, rc = row["user_id"], row["retry_count"] or 0
     reclaimed = bool(row.get("processing_generation", 0) > 1)
+    external = recognize.uses_external_api()
+    backend = recognize.backend_name()
     t0 = time.time()
     log.info(
         f"[{tid}] {'接管/重新领取' if reclaimed else '领取'} sid={sid} uid={uid} "
-        f"gen={generation} lease={PROCESSING_LEASE_SEC:.1f}s 第 {rc + 1} 次业务尝试"
+        f"gen={generation} lease={PROCESSING_LEASE_SEC:.1f}s backend={backend} "
+        f"第 {rc + 1} 次业务尝试"
     )
 
     heartbeat = ProcessingLeaseHeartbeat(sid, tid, generation)
     heartbeat.start()
     try:
-        # 欠费：不消耗 retry，fenced 地转 arrears。
-        balance = billing.get_balance(uid)
-        if billing.is_arrears(uid):
-            if heartbeat.lost.is_set():
-                _stale_result(tid, sid, generation, "arrears")
+        # 只有第三方 API 模式才检查模拟调用额度；内部模型不让员工“为截图识别付费”。
+        if external:
+            balance = billing.get_balance(uid)
+            if billing.is_arrears(uid):
+                if heartbeat.lost.is_set():
+                    _stale_result(tid, sid, generation, "external_quota")
+                    return True
+                if heartbeat.uncertain.is_set():
+                    _log_uncertain_commit(tid, sid, generation, "external_quota")
+                if not sm.transition_owned(
+                    sid,
+                    "arrears",
+                    tid,
+                    generation,
+                    result_msg="外部识图 API 调用额度不足",
+                ):
+                    _stale_result(tid, sid, generation, "external_quota")
+                else:
+                    log.error(
+                        f"[{tid}] sid={sid} gen={generation} 外部 API 额度不足 uid={uid} "
+                        f"credits={balance} -> 转 arrears（待额度恢复，不消耗 retry）"
+                    )
                 return True
-            if heartbeat.uncertain.is_set():
-                _log_uncertain_commit(tid, sid, generation, "arrears")
-            if not sm.transition_owned(
-                sid,
-                "arrears",
-                tid,
-                generation,
-                result_msg="账户欠费，识图服务不可用",
-            ):
-                _stale_result(tid, sid, generation, "arrears")
-            else:
-                log.error(
-                    f"[{tid}] sid={sid} gen={generation} 欠费 uid={uid} 余额={balance} "
-                    "-> 转 arrears（待充值，不消耗 retry）"
-                )
-            return True
+            log.info(
+                f"[{tid}] sid={sid} gen={generation} 外部 API 额度检查通过 credits={balance}"
+            )
 
-        log.info(
-            f"[{tid}] sid={sid} gen={generation} 计费检查通过 余额={balance}，调用识图模型..."
-        )
-
+        log.info(f"[{tid}] sid={sid} gen={generation} 调用 {backend} 识图后端...")
         t_model = time.time()
         ok, version, msg = recognize.call_vision_model(sid, rc)
         cost_model = (time.time() - t_model) * 1000
         log.info(
-            f"[{tid}] sid={sid} gen={generation} 识图模型返回 ok={ok} 版本={version} "
+            f"[{tid}] sid={sid} gen={generation} backend={backend} 返回 ok={ok} 版本={version} "
             f"耗时={cost_model:.1f}ms（{msg}）"
         )
 
@@ -182,6 +180,27 @@ def handle_one(tid: str):
             _log_uncertain_commit(tid, sid, generation, "after_model")
 
         if not ok:
+            # token incident pause / secret missing / stale credential 不是“截图识别失败”。
+            # 保持 retry_count 不变，把任务放回 pending，避免安全 containment 把业务 retry 烧光进 DLQ。
+            if external and recognize.is_external_control_block(msg):
+                next_attempt_at = time.time() + CONTROL_BLOCK_RETRY_SEC
+                if sm.transition_owned(
+                    sid,
+                    "pending",
+                    tid,
+                    generation,
+                    retry_count=rc,
+                    next_attempt_at=next_attempt_at,
+                    result_msg=msg,
+                ):
+                    log.warning(
+                        f"[{tid}] sid={sid} gen={generation} external control block -> "
+                        f"{CONTROL_BLOCK_RETRY_SEC:.1f}s 后再检查，业务 retry 仍为 {rc}（{msg}）"
+                    )
+                else:
+                    _stale_result(tid, sid, generation, "external_control_block")
+                return True
+
             new_rc = rc + 1
             if new_rc >= db.MAX_RETRY:
                 if sm.transition_owned(
@@ -218,29 +237,50 @@ def handle_one(tid: str):
                     _stale_result(tid, sid, generation, "retry")
             return True
 
-        # 成功结果：版本核验 + fenced finalize。任务状态和本地计费在同一个 DB transaction。
         passed = recognize.meets_version(version, recognize.REQUIRED_VERSION)
         verdict = (
             f"核验通过：识别版本 {version} >= 要求 {recognize.REQUIRED_VERSION}"
             if passed
             else f"核验未通过：识别版本 {version} < 要求 {recognize.REQUIRED_VERSION}"
         )
+
+        # 内部模型 cost=0；外部 API 才消耗模拟 credits。finalize + charge 在同一事务里。
+        charge_cost = billing.COST_PER_CALL if external else 0.0
         finalized, after = sm.finalize_done_owned(
             sid,
             tid,
             generation,
-            billing.COST_PER_CALL,
+            charge_cost,
             version,
             recognize.REQUIRED_VERSION,
             verdict,
         )
         if not finalized:
+            # 对外部模式，可能是两个不同任务都通过了旧余额检查，最终只有一个能原子扣费。
+            # 如果额度已耗尽且 ownership 仍有效，就转 arrears；若已经 stale，fenced transition 会失败。
+            if external and billing.is_arrears(uid):
+                if sm.transition_owned(
+                    sid,
+                    "arrears",
+                    tid,
+                    generation,
+                    result_msg="外部 API 额度在并发提交时被其他任务耗尽",
+                ):
+                    log.warning(
+                        f"[{tid}] sid={sid} gen={generation} finalize 时额度不足 -> arrears；"
+                        "数据库条件扣费保证 credits 不会变成负数"
+                    )
+                    return True
             _stale_result(tid, sid, generation, "finalize")
             return True
 
-        log.info(
-            f"[{tid}] sid={sid} gen={generation} 完成原子扣费 {billing.COST_PER_CALL} -> 余额 {after}"
-        )
+        if external:
+            log.info(
+                f"[{tid}] sid={sid} gen={generation} 外部 API 模拟扣费 {charge_cost} -> credits {after}"
+            )
+        else:
+            log.info(f"[{tid}] sid={sid} gen={generation} 内部模型模式：不做外部 API 扣费")
+
         log.info(
             f"[{tid}] sid={sid} gen={generation} 版本核验 {'通过' if passed else '未通过'} -> {verdict} "
             f"| 本次总耗时 {(time.time() - t0) * 1000:.1f}ms"
@@ -251,14 +291,18 @@ def handle_one(tid: str):
 
 
 def recover_arrears(tid: str):
-    """余额恢复后，把欠费任务重新放回队列。arrears 不属于 processing ownership。"""
+    """外部 API 额度恢复，或切到 internal backend 后，把 arrears 任务重新放回队列。"""
     sid = db.find_arrears_id()
     if sid is None:
         return
     row = db.get_task(sid)
-    if row and not billing.is_arrears(row["user_id"]):
-        if sm.transition(sid, "pending", next_attempt_at=0, result_msg="余额已恢复，重新入队"):
-            log.info(f"[{tid}] sid={sid} 余额已恢复 -> 重新入队")
+    if not row:
+        return
+    external = recognize.uses_external_api()
+    if (not external) or (not billing.is_arrears(row["user_id"])):
+        reason = "已切换内部模型，重新入队" if not external else "外部 API 额度已恢复，重新入队"
+        if sm.transition(sid, "pending", next_attempt_at=0, result_msg=reason):
+            log.info(f"[{tid}] sid={sid} {reason}")
 
 
 def loop(tid: str):
@@ -268,7 +312,6 @@ def loop(tid: str):
             if not handle_one(tid):
                 time.sleep(POLL_INTERVAL)
         except Exception:
-            # processing 期间异常不会手工改回 pending；停止 heartbeat 后 lease 到期即可由其他 worker 接管。
             log.exception(f"[{tid}] 处理任务异常；若已领取，等待 processing lease 到期后自动恢复")
             time.sleep(POLL_INTERVAL)
 
@@ -277,7 +320,9 @@ def main():
     db.init_db()
     log.info(
         f"{NAME} 启动 | 并发线程={THREADS} | retry上限={db.MAX_RETRY} | "
+        f"backend={recognize.backend_name()} | "
         f"退避基数={RETRY_BASE_SEC}s 上限={RETRY_MAX_SEC}s | "
+        f"control-block重试={CONTROL_BLOCK_RETRY_SEC}s | "
         f"processing lease={PROCESSING_LEASE_SEC}s heartbeat={PROCESSING_HEARTBEAT_SEC}s | "
         f"要求版本={recognize.REQUIRED_VERSION}"
     )

@@ -12,7 +12,8 @@ STATES = {
     "done": "完成",
     "dlq": "待人工审核",
     "rejected": "提交被拒绝",
-    "arrears": "欠费待充值",
+    # 历史状态名保留 arrears，语义现在是“外部 API 调用额度不足”；内部模型模式不会进入它。
+    "arrears": "外部 API 额度不足",
 }
 
 ALLOWED = {
@@ -91,7 +92,11 @@ def transition_owned(sid: int, to: str, owner: str, generation: int, **fields) -
 
 def finalize_done_owned(sid: int, owner: str, generation: int, cost: float,
                         detected_version: str, required_version: str, result_msg: str):
-    """processing -> done 与本地计费原子提交；stale worker 不得扣费。"""
+    """processing -> done 的 fenced 原子提交。
+
+    internal backend 传 cost=0，不做额度扣减；external backend 传正数 cost，任务完成与
+    条件扣费在同一个 SQLite transaction。stale worker 或额度不足都不能留下半套结果。
+    """
     ok, balance = db.finalize_processing_and_charge(
         sid,
         owner,
@@ -104,12 +109,19 @@ def finalize_done_owned(sid: int, owner: str, generation: int, cost: float,
         },
     )
     if ok:
-        log.info(
-            f"fenced 完成 sid={sid} gen={generation} owner={owner} processing -> done "
-            f"balance={balance}"
-        )
+        if cost > 0:
+            log.info(
+                f"fenced 完成 sid={sid} gen={generation} owner={owner} processing -> done "
+                f"external_credits={balance}"
+            )
+        else:
+            log.info(
+                f"fenced 完成 sid={sid} gen={generation} owner={owner} processing -> done "
+                "internal_backend_no_charge"
+            )
     else:
         log.warning(
-            f"fenced 完成被拒绝 sid={sid} gen={generation} owner={owner}，未扣费"
+            f"fenced 完成被拒绝 sid={sid} gen={generation} owner={owner}，"
+            "可能是 stale ownership 或外部 API 额度不足"
         )
     return ok, balance
