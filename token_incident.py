@@ -5,7 +5,7 @@
   python3 token_incident.py start --reason "token pasted into public log"
   python3 token_incident.py scope --incident INC-xxxx --detail "request ids ..."
   python3 token_incident.py vendor --incident INC-xxxx --detail "vendor acknowledged quarantine"
-  python3 token_incident.py close --incident INC-xxxx --approve --vendor-confirmed
+  python3 token_incident.py close --incident INC-xxxx --approve --vendor-confirmed --credential-deployed
   python3 token_incident.py show --incident INC-xxxx
 
 这个脚本不会处理真实供应商数据，也不会存储真实 token；它只展示 GRC 自动化里
@@ -30,24 +30,36 @@ def cmd_start(args):
         incident_id,
         "scope_investigation_started",
         "collect request ids / timestamps / affected data categories",
+        require_active=True,
     )
     provider_control.record_event(
         incident_id,
         "vendor_containment_requested",
         "request provider to freeze/quarantine suspected window while scope is refined",
+        require_active=True,
     )
     print(json.dumps({"incident_id": incident_id, "provider_state": state}, ensure_ascii=False, indent=2))
 
 
 def cmd_scope(args):
     db.init_db()
-    provider_control.record_event(args.incident, "scope_assessed", args.detail)
+    provider_control.record_event(
+        args.incident,
+        "scope_assessed",
+        args.detail,
+        require_active=True,
+    )
     print(json.dumps({"incident_id": args.incident, "stage": "scope_assessed"}, ensure_ascii=False))
 
 
 def cmd_vendor(args):
     db.init_db()
-    provider_control.record_event(args.incident, "vendor_acknowledgement", args.detail)
+    provider_control.record_event(
+        args.incident,
+        "vendor_acknowledgement",
+        args.detail,
+        require_active=True,
+    )
     print(json.dumps({"incident_id": args.incident, "stage": "vendor_acknowledgement"}, ensure_ascii=False))
 
 
@@ -57,6 +69,7 @@ def cmd_close(args):
         args.incident,
         human_approved=args.approve,
         vendor_confirmed=args.vendor_confirmed,
+        credential_deployed=args.credential_deployed,
     )
     print(json.dumps({"incident_id": args.incident, "provider_state": state}, ensure_ascii=False, indent=2))
 
@@ -92,6 +105,7 @@ def main():
     p.add_argument("--incident", required=True)
     p.add_argument("--approve", action="store_true")
     p.add_argument("--vendor-confirmed", action="store_true")
+    p.add_argument("--credential-deployed", action="store_true")
     p.set_defaults(func=cmd_close)
 
     p = sub.add_parser("show")
