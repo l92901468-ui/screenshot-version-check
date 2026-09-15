@@ -86,12 +86,14 @@ Targeted remediation / deletion
         ↓
 Vendor confirmation
         ↓
-Resume provider with rotated credential
+Deploy rotated credential
+        ↓
+Resume provider
         ↓
 Close + audit evidence
 ```
 
-本 demo 用 `provider_control.py` 持久化共享 provider 状态和 append-only incident events；`token_incident.py` 提供可运行的模拟命令。
+本 demo 用 `provider_control.py` 持久化共享 provider 状态、当前 active incident id 和 append-only incident events；`token_incident.py` 提供可运行的模拟命令。开始 containment 后，同一个 provider 不允许再开启第二个重叠 incident，避免审计事件串错。
 
 示例：
 
@@ -100,7 +102,7 @@ python3 token_incident.py start --reason "token pasted into public log" --suspec
 # 记下输出的 INC-xxxx
 python3 token_incident.py scope --incident INC-xxxx --detail "requests 1201-1249; screenshots only"
 python3 token_incident.py vendor --incident INC-xxxx --detail "vendor acknowledged quarantine"
-python3 token_incident.py close --incident INC-xxxx --approve --vendor-confirmed
+python3 token_incident.py close --incident INC-xxxx --approve --vendor-confirmed --credential-deployed
 python3 token_incident.py show --incident INC-xxxx
 ```
 
@@ -108,8 +110,12 @@ python3 token_incident.py show --incident INC-xxxx
 
 如果只在某个 worker 内存里设 `paused=True`，其他 worker 仍可能继续用泄露 token 调供应商，这又把系统变成有本地权威状态。共享 provider control 让所有 worker 看到同一 containment 状态。
 
+### 为什么 rotate 以后还要显式确认 credential 已部署？
+
+“把 credential generation +1”只是本 demo 的控制面模拟，不等于真实新 secret 已经送到所有 worker。恢复 provider 之前必须确认 rotated credential 已通过 secret manager / 受控渠道部署完成；否则一恢复流量，旧 worker 只会拿旧 token 打出一片 `401`。
+
 ### 什么由自动化做，什么留给人？
 
 自动化适合：检测后创建 incident、保存最小证据、立即 revoke/rotate、暂停 provider、初始告警、收集 request IDs / 时间窗、生成 vendor containment request、跟踪 acknowledgement。
 
-人工边界：最终 scope 判断、不可逆删除、供应商数据处置确认、incident close。这样既不因为“等人批准”而延误 credential containment，也不让 Agent/脚本直接做不可逆高风险动作。
+人工边界：最终 scope 判断、不可逆删除、供应商数据处置确认、确认新 credential 已部署、incident close。这样既不因为“等人批准”而延误 credential containment，也不让 Agent/脚本直接做不可逆高风险动作。
